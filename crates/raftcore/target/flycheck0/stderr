@@ -1,2 +1,0 @@
-warning: unused config key `source.ripgrep.registries` in `/home/carter/.cargo/config.toml`
-    Blocking waiting for file lock on package cache
