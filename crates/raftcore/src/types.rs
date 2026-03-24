@@ -12,6 +12,7 @@ pub type NodeId = u64;
 #[derive(Debug)]
 pub enum Action {
     SendMessage { target: NodeId, message: Message },
+    ApplyToStateMachine { command: Vec<u8> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,6 +33,7 @@ pub struct RequestVoteRPC {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestVoteResponseRPC {
+    /// Id of responder
     pub id: u64,
     pub term: u64,
     pub vote_granted: bool,
@@ -73,6 +75,9 @@ pub struct AppendEntriesResponseRPC {
 
     /// Term of the node
     pub term: u64,
+
+    /// Match index this follower is on based on the new AppendEntries received
+    pub match_index: u64,
 
     /// Whether the node has an entry at prev_log_index with prev_log_term
     pub success: bool,
