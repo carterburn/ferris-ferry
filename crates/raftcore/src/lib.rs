@@ -13,6 +13,37 @@ use rand::prelude::*;
 
 mod types;
 
+/// A sans-i/o(-ish) implementation of the Raft Consensus Algorithm.
+///
+/// This type provides a means to setup a node to participate in a cluster of nodes using the
+/// Raft Consensus Algorithm. This type requires _NO_ I/O, meaning it will not perform any actual
+/// networking on behalf of the user. The logic of the algorithm is the only thing this type does
+/// and will emit "Actions" for an event loop to take. Of course, an event loop could ignore these
+/// actions, but that would make the entire use of this type a waste.
+///
+/// See below discussion why this isn't a fully sans-i/o type and why certain cautions should be
+/// taken when using this type with async runtimes like Tokio.
+///
+/// An event loop does need to be aware of the types that it will use to interact with the node.
+///
+/// Action:
+/// - SendMessage: This Action directs an Event Loop to perform I/O to send a message to another
+/// peer. Raft itself requires disk I/O to persist certain state to disk. This is why this is a
+/// sans-i/o(-ish) implementation. This type WILL perform I/O to write state to disk. The reason
+/// for this design decision is based solely on the original Raft paper. The algorithm cannot
+/// continue until certain state has been persisted. That means, for example, when voting for a
+/// node or starting an election, variables that must be persistent have to be written to disk
+/// prior to responding to any other node. As such, this type uses synchronous I/O to write to disk
+/// to ensure that the state has been persisted. For event loops using async runtimes like Tokio,
+/// you should likely write your loop within a spawn_blocking task to indicate that the task will
+/// spawn. You can still call non-blocking (async) tasks within a spawn_blocking task.
+/// - ApplyToStateMachine: This Action directs an Event Loop to provide the higher level "state
+/// machine" or type that is using Raft to apply the command. For example, this could be a
+/// Key-Value store that needs to apply a command such as "set x -> 8". The KV store would then set
+/// the key "x" to value "8" and know that it is replicated across a majority of the nodes. Of
+/// note, some ApplyToStateMachine commands will be blank. This is an artifact of a Raft
+/// optimization to help catch followers up. Event loops can safely skip from delivering this
+/// Action to the higher level application.
 struct RaftCore {
     id: NodeId,
     peers: Vec<NodeId>,
@@ -557,16 +588,28 @@ mod tests {
             let _ = self.deliver_all();
             // get responses back to the leader (who will then commit)
             let _ = self.deliver_all();
+            // all responses will FAIL because prev_log_index is 1 (based on leader's log)
 
-            // do another append entries (heartbeat) to get followers synced and deliver all
+            // do another append entries (heartbeat) to get followers synced and deliver the dummy
+            // entry
             let actions = self.node_mut(id).append_entries();
             self.collect_actions(id, actions);
             let _ = self.deliver_all();
             // clear out pending with the responses to the heartbeat to start clean
             let _ = self.deliver_all();
 
-            // followers all synced
             assert_eq!(self.node(id).commit_index, 1);
+
+            // now, to get the followers to sync their commit index as well, we need to do another
+            // heartbeat for them to learn that the leader committed
+            let actions = self.node_mut(id).append_entries();
+            self.collect_actions(id, actions);
+            let _ = self.deliver_all();
+            let _ = self.deliver_all();
+            // cluster is fully synced
+            for node_id in self.nodes.keys() {
+                assert_eq!(self.node(*node_id).commit_index, 1);
+            }
         }
 
         /// Drains the pending_messages queue and delivers all messages to recipients. Queues up
@@ -1495,8 +1538,7 @@ mod tests {
     fn full_append_entries_message() {
         let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
 
-        // propose a new command and sync it across the cluster; should have ApplyToStateMachine
-        // for node1 (leader)
+        // propose a new command and sync it across the cluster
         let actions = cluster.propose_and_sync(DUMMY.to_vec());
 
         // check node2 and node3 have their next and match index updated in the leader
@@ -1616,257 +1658,156 @@ mod tests {
         // to 2
         assert_eq!(node2.commit_index, 2);
         assert_eq!(node3.commit_index, 2);
+
+        // propose and sync a command across the cluster
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+
+        // propose a new command and sync it across the cluster
+        let actions = cluster.propose_and_sync(DUMMY.to_vec());
+
+        // check that the follower's have ApplyToStateMachine Actions and that they advanced their
+        // commit index to 2
+        assert_eq!(cluster.node(2).commit_index, 2);
+        let node_actions = actions.get(&2).unwrap();
+        assert_eq!(node_actions.len(), 1);
+        assert!(matches!(
+            node_actions[0],
+            Action::ApplyToStateMachine { command: _ }
+        ));
+        assert_eq!(cluster.node(3).commit_index, 2);
+        let node_actions = actions.get(&3).unwrap();
+        assert_eq!(node_actions.len(), 1);
+        assert!(matches!(
+            node_actions[0],
+            Action::ApplyToStateMachine { command: _ }
+        ));
     }
 
     #[test]
     fn leader_commit_three_node_cluster() {
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        // get the dummy entry committed on every single node first then we'll do the commit check
-        // with one entry
-        let actions = make_leader_with_actions(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-        );
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        // need to send one more for the followers to advance their commit indices when they see
-        // that the leader has committed the dummy entry
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
+        // this test partitions one node, but shows that with just one node responding to a
+        // proposed command, the leader will still commit because the entry is replicated across a
+        // majority of the cluster
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+        // partition node3 off
+        cluster.partition(3);
 
-        let Some(actions) = node1.propose(DUMMY.to_vec()) else {
-            panic!("Node used to call propose not a leader");
-        };
-
-        let append_entries = extract_append_entries(actions);
-        // deliver append entries to the followers
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-
-        // should have two responses
-        assert_eq!(responses.len(), 2);
-
-        // to get a majority for this AppendEntries, only ONE follower needs to have responded
-        // correctly, so check if node1 (leader) updates commit_index to 1 when it gets delivered a
-        // single response
-        let to_deliver = &(responses[0].1);
-        let actions = node1.handle_append_entries_response(to_deliver.clone());
-        assert_eq!(actions.len(), 1);
+        // propose and attempt to sync across the entire cluster; only node1 and 2 will have their
+        // commit_index set to 2, 3 will be partitioned
+        let actions = cluster.propose_and_sync(DUMMY.to_vec());
+        let leader_actions = actions
+            .get(&cluster.leader.expect("No leader for cluster"))
+            .unwrap();
+        assert_eq!(leader_actions.len(), 1);
         assert!(matches!(
-            actions[0],
+            leader_actions[0],
             Action::ApplyToStateMachine { command: _ }
         ));
-        assert_eq!(node1.commit_index, 2);
+        assert_eq!(
+            cluster
+                .node(cluster.leader.expect("No leader for cluster"))
+                .commit_index,
+            2
+        );
+        assert_eq!(cluster.node(2).commit_index, 2);
+        assert_eq!(cluster.node(3).commit_index, 1);
     }
 
     #[test]
     fn leader_commit_five_node_cluster() {
         // same test as leader_commit_three_node_cluster, just with five nodes to test our majority
         // computation still holds
-        let (mut node1, mut node2, mut node3, mut node4, mut node5) = init_five_node_noop_cluster();
-        // get the dummy entry committed on every single node first then we'll do the commit check
-        // with one entry
-        let actions = make_leader_with_actions(
-            &mut node1,
-            HashMap::from([
-                (2, &mut node2),
-                (3, &mut node3),
-                (4, &mut node4),
-                (5, &mut node5),
-            ]),
-        );
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([
-                (2, &mut node2),
-                (3, &mut node3),
-                (4, &mut node4),
-                (5, &mut node5),
-            ]),
-            actions,
-        );
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([
-                (2, &mut node2),
-                (3, &mut node3),
-                (4, &mut node4),
-                (5, &mut node5),
-            ]),
-            actions,
-        );
-        // need to send one more for the followers to advance their commit indices when they see
-        // that the leader has committed the dummy entry
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([
-                (2, &mut node2),
-                (3, &mut node3),
-                (4, &mut node4),
-                (5, &mut node5),
-            ]),
-            actions,
-        );
-
-        let Some(actions) = node1.propose(DUMMY.to_vec()) else {
-            panic!("Node used to call propose not a leader");
-        };
-
-        let append_entries = extract_append_entries(actions);
-        // deliver append entries to the followers
-        let responses = deliver_append_entries(
-            HashMap::from([
-                (2, &mut node2),
-                (3, &mut node3),
-                (4, &mut node4),
-                (5, &mut node5),
-            ]),
-            append_entries,
-        );
-
-        // should have four responses
-        assert_eq!(responses.len(), 4);
-
-        // for the majority here, we need TWO followers to respond (because including our entry we
-        // get 3 which is a majority for 5)
-        let delivery_one = &(responses[0].1);
-        let delivery_two = &(responses[1].1);
-
-        let actions_one = node1.handle_append_entries_response(delivery_one.clone());
-        // shouldn't have any actions with this! need one more delivery
-        assert_eq!(actions_one.len(), 0);
-
-        // deliver the next and expect an apply action
-        let actions_two = node1.handle_append_entries_response(delivery_two.clone());
-        assert_eq!(actions_two.len(), 1);
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3, 4, 5], 1);
+        // partition node4 and 5 off
+        cluster.partition(4);
+        cluster.partition(5);
+        let actions = cluster.propose_and_sync(DUMMY.to_vec());
+        let leader_actions = actions
+            .get(&cluster.leader.expect("No leader for cluster"))
+            .unwrap();
+        assert_eq!(leader_actions.len(), 1);
         assert!(matches!(
-            actions_two[0],
+            leader_actions[0],
             Action::ApplyToStateMachine { command: _ }
         ));
-        assert_eq!(node1.commit_index, 2);
-    }
-
-    #[test]
-    fn implicit_commit_check() {
-        // verify that the no-op entry from the leader upon election causes the commit index on the
-        // followers to advance to 1
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        let actions = make_leader_with_actions(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
+        // leader should be at 2 for commit_index
+        assert_eq!(
+            cluster
+                .node(cluster.leader.expect("No leader for cluster"))
+                .commit_index,
+            2
         );
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        // need to send one more for the followers to advance their commit indices when they see
-        // that the leader has committed the dummy entry
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-
-        assert_eq!(node2.commit_index, 1);
-        assert_eq!(node3.commit_index, 1);
+        // node2 and node3 also at 2
+        assert_eq!(cluster.node(2).commit_index, 2);
+        assert_eq!(cluster.node(3).commit_index, 2);
+        // node4 and node5 still have a commit_index of 1
+        assert_eq!(cluster.node(4).commit_index, 1);
+        assert_eq!(cluster.node(5).commit_index, 1);
     }
 
     #[test]
     fn multiple_entries_applied() {
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        let actions = make_leader_with_actions(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-        );
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        // need to send one more for the followers to advance their commit indices when they see
-        // that the leader has committed the dummy entry
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
+        // this test attempts to bulk send entries to followers. we'll first get everyone synced,
+        // then cause a parition to occur so that the first proposal doesn't work
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+        cluster.partition(2);
+        cluster.partition(3);
 
-        // make two proposals but only send the second proposal
-        let Some(_) = node1.propose(DUMMY.to_vec()) else {
-            panic!("Node used to call propose not a leader");
-        };
+        // propose the first command (won't get delivered)
+        cluster.propose_and_sync(DUMMY.to_vec());
+
+        // heal the partition and propose and sync another command
+        cluster.heal(2);
+        cluster.heal(3);
+
         let mut second = DUMMY.to_vec();
         second.push(b'2');
-        let Some(actions) = node1.propose(second) else {
-            panic!("Node used to call propose not a leader");
-        };
-
-        // check we're 'batching' the entries
-        if let Action::SendMessage { target: _, message } = &actions[0] {
-            if let Message::AppendEntries(msg) = message {
-                assert_eq!(msg.entries.len(), 2);
-            } else {
-                panic!("Unexpected message");
-            }
-        } else {
-            panic!("Unexpected action");
-        }
-
-        let append_entries = extract_append_entries(actions);
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
+        cluster.propose(second);
+        // check that we are batching commands (2 entries in the message)
+        assert_eq!(
+            cluster
+                .pending_messages
+                .iter()
+                .filter(|(_, _, msg)| match msg {
+                    Message::AppendEntries(req) => req.entries.len() == 2,
+                    _ => false,
+                })
+                .count(),
+            2
         );
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
 
-        // ensure that both entries are now committed (commit_index on the leader should be 3)
-        // and that the actions contain two apply to state machine actions for each of the indices
-        assert_eq!(node1.commit_index, 3);
-        let mut cmd1 = false;
-        let mut cmd2 = false;
-        for a in actions {
-            if let Action::ApplyToStateMachine { command } = a {
-                if *command.last().unwrap() == b'D' {
-                    cmd1 = true;
-                } else if *command.last().unwrap() == b'2' {
-                    cmd2 = true;
+        // collect actions, deliver twice to get it all out and check leader advances commit_index
+        // to 3
+        let leader_id = cluster.leader.expect("No leader for cluster");
+        let _ = cluster.deliver_all();
+        let leader_actions = cluster.deliver_all();
+
+        assert_eq!(cluster.node(leader_id).commit_index, 3);
+        // send out a heartbeat and get followers to have a commit_index of 3 and check their
+        // commands
+        let heartbeat = cluster.node_mut(leader_id).append_entries();
+        let _ = cluster.collect_actions(leader_id, heartbeat);
+        let follower_actions = cluster.deliver_all();
+        let _ = cluster.deliver_all();
+        assert_eq!(cluster.node(2).commit_index, 3);
+        assert_eq!(cluster.node(3).commit_index, 3);
+        for (id, actions) in follower_actions {
+            let mut cmd1 = false;
+            let mut cmd2 = false;
+            println!("{actions:?}");
+            assert_eq!(actions.len(), 2);
+            for a in actions {
+                if let Action::ApplyToStateMachine { command } = a {
+                    if *command.last().unwrap() == b'D' {
+                        cmd1 = true;
+                    } else if *command.last().unwrap() == b'2' {
+                        cmd2 = true;
+                    }
                 }
             }
+            // each node should have both commands applied
+            assert!(cmd1 && cmd2);
         }
-
-        assert!(cmd1 && cmd2);
     }
 
     #[test]
@@ -1928,67 +1869,50 @@ mod tests {
         // here we will propose a command and only send it to node2, then we'll propose another
         // command and send to both. in the AppendEntries there, we should have 2 entries for node3
         // (one for node2) and node3 should append those log entries
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        let actions = make_leader_with_actions(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-        );
-        // deliver the dummy entry to the nodes before making a new proposal
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        // send an (empty AppendEntries) to update next_index (leader needs to see that )
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
 
-        // make a proposal
-        let Some(actions) = node1.propose(DUMMY.to_vec()) else {
-            panic!("Node used to call propose not a leader");
-        };
+        // partition node3 off
+        cluster.partition(3);
 
-        let append_entries = extract_append_entries(actions);
-        // only deliver to node2 and get node2's response
-        let response = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries
-                .into_iter()
-                .filter(|(id, _)| *id == 2)
-                .collect(),
-        );
-        assert_eq!(response.len(), 1);
-        deliver_append_entries_responses(&mut node1, response);
+        // propose and sync a command
+        cluster.propose_and_sync(DUMMY.to_vec());
 
-        // propose another command
+        // heal the partition and propose and sync another command
+        cluster.heal(3);
+
         let mut second = DUMMY.to_vec();
         second.push(b'2');
-        let Some(actions) = node1.propose(second) else {
-            panic!("Node used to call propose not a leader");
-        };
-        let append_entries = extract_append_entries(actions);
-        // check each one
-        for (id, msg) in &append_entries {
-            if *id == 2 {
-                assert_eq!(msg.entries.len(), 1);
-            } else {
-                assert_eq!(msg.entries.len(), 2);
-            }
-        }
-        // send to peers and deliver responses to leader
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
+        cluster.propose(second.clone());
+        // check that we are batching commands for node3
+        assert_eq!(
+            cluster
+                .pending_messages
+                .iter()
+                .filter(|(_, to, msg)| match msg {
+                    Message::AppendEntries(req) => *to == 3 && req.entries.len() == 2,
+                    _ => false,
+                })
+                .count(),
+            1
         );
-        deliver_append_entries_responses(&mut node1, responses);
 
-        // check that node3's log is now len of 4 and that next_index in leader's state is also 4
-        assert_eq!(node3.log.len(), 4);
-        assert_eq!(*node1.next_index.get(&3).unwrap(), 4);
+        // collect actions, deliver twice to get it all out
+        let _ = cluster.deliver_all();
+        let _ = cluster.deliver_all();
+
+        // check node3 has the two entries in its log
+        assert_eq!(cluster.node(3).log.len(), 4);
+        assert_eq!(cluster.node(3).log[2].command, DUMMY.to_vec());
+        assert_eq!(cluster.node(3).log[3].command, second);
+        // and that next index for node3 is 4
+        assert_eq!(
+            *cluster
+                .node(cluster.leader.expect(("No leader for cluster")))
+                .next_index
+                .get(&3)
+                .unwrap(),
+            4
+        );
     }
 
     #[test]
