@@ -13,7 +13,7 @@ use rand::prelude::*;
 
 mod types;
 
-/// A sans-i/o(-ish) implementation of the Raft Consensus Algorithm.
+/// A sans-i/o implementation of the Raft Consensus Algorithm.
 ///
 /// This type provides a means to setup a node to participate in a cluster of nodes using the
 /// Raft Consensus Algorithm. This type requires _NO_ I/O, meaning it will not perform any actual
@@ -21,29 +21,33 @@ mod types;
 /// and will emit "Actions" for an event loop to take. Of course, an event loop could ignore these
 /// actions, but that would make the entire use of this type a waste.
 ///
-/// See below discussion why this isn't a fully sans-i/o type and why certain cautions should be
-/// taken when using this type with async runtimes like Tokio.
-///
 /// An event loop does need to be aware of the types that it will use to interact with the node.
+/// One important note to event loop implementors: you must handle the Action's received from
+/// RaftCare IN ORDER for protocol correctness. If you do not, you run the risk of breaking some
+/// invariants of the protocol and lose the consistency guarantees made by Raft.
 ///
 /// Action:
 /// - SendMessage: This Action directs an Event Loop to perform I/O to send a message to another
-/// peer. Raft itself requires disk I/O to persist certain state to disk. This is why this is a
-/// sans-i/o(-ish) implementation. This type WILL perform I/O to write state to disk. The reason
-/// for this design decision is based solely on the original Raft paper. The algorithm cannot
-/// continue until certain state has been persisted. That means, for example, when voting for a
-/// node or starting an election, variables that must be persistent have to be written to disk
-/// prior to responding to any other node. As such, this type uses synchronous I/O to write to disk
-/// to ensure that the state has been persisted. For event loops using async runtimes like Tokio,
-/// you should likely write your loop within a spawn_blocking task to indicate that the task will
-/// spawn. You can still call non-blocking (async) tasks within a spawn_blocking task.
+///   peer. It is important to note that this Action can be dispatched to a separate thread / task
+///   without waiting on the result. The other task should simply attempt to send the message with
+///   its best effort and not worry if a response is received or not.
 /// - ApplyToStateMachine: This Action directs an Event Loop to provide the higher level "state
-/// machine" or type that is using Raft to apply the command. For example, this could be a
-/// Key-Value store that needs to apply a command such as "set x -> 8". The KV store would then set
-/// the key "x" to value "8" and know that it is replicated across a majority of the nodes. Of
-/// note, some ApplyToStateMachine commands will be blank. This is an artifact of a Raft
-/// optimization to help catch followers up. Event loops can safely skip from delivering this
-/// Action to the higher level application.
+///   machine" or type that is using Raft to apply the command. For example, this could be a
+///   Key-Value store that needs to apply a command such as "set x -> 8". The KV store would then set
+///   the key "x" to value "8" and know that it is replicated across a majority of the nodes. Of
+///   note, some ApplyToStateMachine commands will be blank. This is an artifact of a Raft
+///   optimization to help catch followers up. Event loops can safely skip from delivering this
+///   Action to the higher level application.
+/// - PersistMetadata: This Action directs an event loop to write the metadata some metadata file.
+///   It is up to the implementor if that file is the same as the log file (see below for
+///   PersistLogEntries Action). Unlike SendMessage, this Action MUST be synchronous as in it must
+///   complete prior to performing any additional Action's. Without waiting until the information has
+///   been persisted before moving on, Raft protocol invariants may not be met.
+/// - PersistLogEntries: This Action directs an event loop to write LogEntries to a persistent
+///   file at the specified index. This type communicates the start index and the entries to follow
+///   at that index. For example, there may be a start index of 10 and 3 entries, that means the new
+///   entries to persist are at index 10, 11, and 12. This may mean entries in the log are
+///   overwritten, but that is how the Action will communicate with the event loop.
 struct RaftCore {
     id: NodeId,
     peers: Vec<NodeId>,
@@ -123,6 +127,36 @@ impl RaftCore {
         }
     }
 
+    /// Restore this Raft Node from a persistent state. This will restore if a node has crashed the
+    /// current_term, voted_for, and log.
+    ///
+    /// Arguments:
+    /// - id: This node's ID.
+    /// - nodes: A collection of all the NodeId's in the cluster (including THIS node's ID).
+    /// - heartbeat_interval: Optional setting of the number of ticks to heartbeat
+    /// - election_range: Acceptable range for election timeout. Concrete value chosen with each
+    ///   term. Provide the range as ticks based on chosen tick interval (i.e. if ticks are every
+    ///   10ms, and you want a 150-300ms election timeout as noted by the paper, this should be
+    ///   15..31).
+    /// - current_term: The restored term the node was on.
+    /// - voted_for: The restored vote for the current term.
+    /// - log: The restored log.
+    pub fn restore(
+        id: NodeId,
+        nodes: &[NodeId],
+        heartbeat_interval: Option<u64>,
+        election_range: Range<u64>,
+        current_term: u64,
+        voted_for: Option<NodeId>,
+        log: Vec<LogEntry>,
+    ) -> Self {
+        let mut node = Self::new(id, nodes, heartbeat_interval, election_range);
+        node.current_term = current_term;
+        node.voted_for = voted_for;
+        node.log = log;
+        node
+    }
+
     /// The method used for client's to interact with the Raft cluster.
     pub fn propose(&mut self, command: Vec<u8>) -> Option<Vec<Action>> {
         if self.state != RaftState::Leader {
@@ -139,7 +173,12 @@ impl RaftCore {
         self.ticks_since_last_heartbeat = 0;
 
         // send out append entries to peers
-        Some(self.append_entries())
+        let mut actions = vec![Action::PersistLogEntries {
+            start_index: self.log.len() as u64 - 1,
+            entries: self.log[self.log.len() - 1..].to_vec(),
+        }];
+        actions.extend(self.append_entries());
+        Some(actions)
     }
 
     pub fn tick(&mut self) -> Vec<Action> {
@@ -215,7 +254,10 @@ impl RaftCore {
             self.votes_received.insert(self.id);
             self.reset_election_timeout();
 
-            // TODO: persist
+            let mut actions = Vec::from([Action::PersistMetadata {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            }]);
             let request = RequestVoteRPC {
                 term: self.current_term,
                 candidate_id: self.id,
@@ -225,13 +267,11 @@ impl RaftCore {
                 last_log_term: self.log[self.log.len() - 1].term,
             };
             let msg = Message::RequestVote(request);
-            self.peers
-                .iter()
-                .map(|peer_id| Action::SendMessage {
-                    target: *peer_id,
-                    message: msg.clone(),
-                })
-                .collect()
+            actions.extend(self.peers.iter().map(|peer_id| Action::SendMessage {
+                target: *peer_id,
+                message: msg.clone(),
+            }));
+            actions
         } else {
             vec![]
         }
@@ -247,18 +287,26 @@ impl RaftCore {
     /// Function that checks if a message's term is greater than our current term. We step down as
     /// a follower if we receive a message with a higher term and then continue with whatever
     /// message we received
-    fn check_msg_term(&mut self, msg_term: u64) {
+    fn check_msg_term(&mut self, msg_term: u64) -> Option<Vec<Action>> {
         if msg_term > self.current_term {
             self.current_term = msg_term;
             self.state = RaftState::Follower;
             self.voted_for = None;
             self.reset_election_timeout();
-            // TODO: persist
+            Some(vec![Action::PersistMetadata {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            }])
+        } else {
+            None
         }
     }
 
     pub fn handle_request_vote(&mut self, req: RequestVoteRPC) -> Vec<Action> {
-        self.check_msg_term(req.term);
+        let mut actions = Vec::new();
+        if let Some(persist_action) = self.check_msg_term(req.term) {
+            actions.extend(persist_action);
+        }
 
         let false_response = Message::RequestVoteResponse(RequestVoteResponseRPC {
             id: self.id,
@@ -268,10 +316,11 @@ impl RaftCore {
 
         if req.term < self.current_term {
             // the requestor is on an earlier term, so we return false and don't vote for it!
-            return vec![Action::SendMessage {
+            actions.push(Action::SendMessage {
                 target: req.candidate_id,
                 message: false_response,
-            }];
+            });
+            return actions;
         }
 
         let can_vote = match self.voted_for {
@@ -290,29 +339,38 @@ impl RaftCore {
         if grant_vote {
             self.reset_election_timeout();
             self.voted_for = Some(req.candidate_id);
-            // TODO: persist here
-            vec![Action::SendMessage {
-                target: req.candidate_id,
-                message: Message::RequestVoteResponse(RequestVoteResponseRPC {
-                    id: self.id,
+            actions.extend([
+                Action::PersistMetadata {
                     term: self.current_term,
-                    vote_granted: true,
-                }),
-            }]
+                    voted_for: self.voted_for,
+                },
+                Action::SendMessage {
+                    target: req.candidate_id,
+                    message: Message::RequestVoteResponse(RequestVoteResponseRPC {
+                        id: self.id,
+                        term: self.current_term,
+                        vote_granted: true,
+                    }),
+                },
+            ]);
         } else {
-            vec![Action::SendMessage {
+            actions.push(Action::SendMessage {
                 target: req.candidate_id,
                 message: false_response,
-            }]
+            });
         }
+        actions
     }
 
     pub fn handle_request_vote_response(&mut self, resp: RequestVoteResponseRPC) -> Vec<Action> {
-        self.check_msg_term(resp.term);
+        let mut actions = Vec::new();
+        if let Some(persist_actions) = self.check_msg_term(resp.term) {
+            actions.extend(persist_actions);
+        }
 
         // should only get this if we are a candidate
         if !matches!(self.state, RaftState::Candidate) {
-            return vec![];
+            return actions;
         }
         if resp.vote_granted {
             // received a vote for this election
@@ -321,20 +379,24 @@ impl RaftCore {
             if self.votes_received.len() as u64 > ((self.peers.len() as u64 + 1) / 2) {
                 // we won the election, transition to leader state
                 self.state = RaftState::Leader;
-                self.initialize_leader_state();
+                actions.push(self.initialize_leader_state());
                 self.reset_election_timeout();
-                self.append_entries()
+                actions.extend(self.append_entries());
+                actions
             } else {
-                vec![]
+                actions
             }
         } else {
             // didn't get the vote, so we just move on and do nothing
-            vec![]
+            actions
         }
     }
 
     pub fn handle_append_entries(&mut self, req: AppendEntriesRPC) -> Vec<Action> {
-        self.check_msg_term(req.term);
+        let mut actions = Vec::new();
+        if let Some(persist_actions) = self.check_msg_term(req.term) {
+            actions.extend(persist_actions);
+        }
 
         let false_response = Message::AppendEntriesResponse(types::AppendEntriesResponseRPC {
             id: self.id,
@@ -342,11 +404,10 @@ impl RaftCore {
             match_index: self.log.len() as u64 - 1,
             success: false,
         });
-        let false_action = vec![Action::SendMessage {
+        let false_action = Action::SendMessage {
             target: req.leader_id,
             message: false_response,
-        }];
-        let mut success_actions = vec![];
+        };
 
         // check if we are a candidate and step down if the term is at least as big as ours
         // (Section 5.2)
@@ -355,18 +416,19 @@ impl RaftCore {
             // servers voted this server sending req to leader, so we follow suit and become a
             // follower)
             self.state = RaftState::Follower;
-            self.voted_for = None;
         }
 
         // ensure we are a follower
         if self.state != RaftState::Follower {
             // send nothing if we are a leader or candidate
-            return false_action;
+            actions.push(false_action);
+            return actions;
         }
 
         if req.term < self.current_term {
             // "Leader" is on an earlier term, so we send back a false response
-            return false_action;
+            actions.push(false_action);
+            return actions;
         }
 
         // reset election timeout since we have a valid leader on the right term
@@ -378,7 +440,8 @@ impl RaftCore {
             || (req.prev_log_index < self.log.len() as u64
                 && self.log[req.prev_log_index as usize].term == req.prev_log_term);
         if !valid {
-            return false_action;
+            actions.push(false_action);
+            return actions;
         }
 
         // now we start appending entries (and overwrite anything that has a bad term)
@@ -409,12 +472,20 @@ impl RaftCore {
             self.log.push(new_entry);
         }
 
+        // if log has changed (had entries) persist the entries starting from req.prev_log_index + 1
+        if !req.entries.is_empty() {
+            actions.push(Action::PersistLogEntries {
+                start_index: req.prev_log_index + 1,
+                entries: self.log[req.prev_log_index as usize + 1..].to_vec(),
+            });
+        }
+
         // update our commit index
         if req.leader_commit > self.commit_index {
             let old_commit = self.commit_index;
             self.commit_index = min(req.leader_commit, self.log.len() as u64 - 1);
             // we should apply all of the entries between old_commit and the new commit_index
-            success_actions.extend(
+            actions.extend(
                 self.log[old_commit as usize + 1..=self.commit_index as usize]
                     .iter()
                     .map(|entry| Action::ApplyToStateMachine {
@@ -424,7 +495,7 @@ impl RaftCore {
             )
         }
 
-        success_actions.push(Action::SendMessage {
+        actions.push(Action::SendMessage {
             target: req.leader_id,
             message: Message::AppendEntriesResponse(AppendEntriesResponseRPC {
                 id: self.id,
@@ -433,14 +504,17 @@ impl RaftCore {
                 success: true,
             }),
         });
-        success_actions
+        actions
     }
 
     pub fn handle_append_entries_response(
         &mut self,
         resp: AppendEntriesResponseRPC,
     ) -> Vec<Action> {
-        self.check_msg_term(resp.term);
+        let mut actions = Vec::new();
+        if let Some(persist_actions) = self.check_msg_term(resp.term) {
+            actions.extend(persist_actions);
+        }
 
         if resp.success {
             // update the follower's match_index to the provided value in the response
@@ -450,7 +524,8 @@ impl RaftCore {
         } else {
             // now we have to decrement next_index for this client and try the AppendEntries again
             self.next_index.entry(resp.id).and_modify(|v| *v -= 1);
-            return vec![self.build_append_entries_for_peer(resp.id)];
+            actions.push(self.build_append_entries_for_peer(resp.id));
+            return actions;
         };
 
         // grab the minimum value that a majority of servers has in their match_index
@@ -471,7 +546,6 @@ impl RaftCore {
         }
 
         // update commit index and apply all entries from last_applied to commit index
-        let mut actions = Vec::with_capacity((self.commit_index - self.last_applied) as usize);
         self.commit_index = new_commit;
         for index in self.last_applied as usize + 1..=self.commit_index as usize {
             actions.push(Action::ApplyToStateMachine {
@@ -483,7 +557,7 @@ impl RaftCore {
         actions
     }
 
-    fn initialize_leader_state(&mut self) {
+    fn initialize_leader_state(&mut self) -> Action {
         // add a dummy entry in current_term to our log
         self.log.push(LogEntry {
             term: self.current_term,
@@ -495,7 +569,10 @@ impl RaftCore {
             self.match_index.insert(*id, 0);
         }
 
-        // TODO: persist
+        Action::PersistLogEntries {
+            start_index: self.log.len() as u64 - 1,
+            entries: self.log[self.log.len() - 1..].to_vec(),
+        }
     }
 }
 
@@ -1400,8 +1477,7 @@ mod tests {
     #[test]
     fn candidate_steps_down_with_equal_term_append_entries() {
         // a candidate will be seeking votes and receive a AppendEntries RPC from another node with an
-        // equal term. in that case, the candidate should revert to a follower _and_ vote for that
-        // new node
+        // equal term. in that case, the candidate should revert to a follower
         let (mut node1, _node2, _node3) = init_three_node_noop_cluster();
         // make node1 a candidate
         tick_until_candidate(&mut node1);
@@ -1436,8 +1512,7 @@ mod tests {
     #[test]
     fn candidate_steps_down_with_higher_term_append_entries() {
         // a candidate will be seeking votes and receive a AppendEntries RPC from another node with a
-        // higher term. in that case, the candidate should revert to a follower _and_ vote for that
-        // new node
+        // higher term. in that case, the candidate should revert to a follower
         let (mut node1, _node2, _node3) = init_three_node_noop_cluster();
         // make node1 a candidate
         tick_until_candidate(&mut node1);
@@ -1461,15 +1536,21 @@ mod tests {
         assert!(node1.state == RaftState::Follower);
         assert_eq!(node1.current_term, next_term);
 
-        if let Action::SendMessage { target: _, message } = &node1_actions[0] {
-            if let Message::AppendEntriesResponse(resp) = message {
-                assert!(resp.success);
-            } else {
-                panic!("No AppendEntriesResponse");
-            }
-        } else {
-            panic!("No SendMessage Action");
-        }
+        assert_eq!(
+            node1_actions
+                .iter()
+                .filter(|action| match action {
+                    Action::SendMessage {
+                        target: _,
+                        message: Message::AppendEntriesResponse(resp),
+                    } => {
+                        resp.success
+                    }
+                    _ => false,
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1650,6 +1731,7 @@ mod tests {
                     Action::ApplyToStateMachine { command } => {
                         assert_eq!(command, DUMMY.to_vec());
                     }
+                    _ => panic!("Unexpected Action"),
                 }
             }
         }
@@ -1907,7 +1989,7 @@ mod tests {
         // and that next index for node3 is 4
         assert_eq!(
             *cluster
-                .node(cluster.leader.expect(("No leader for cluster")))
+                .node(cluster.leader.expect("No leader for cluster"))
                 .next_index
                 .get(&3)
                 .unwrap(),
@@ -2261,5 +2343,234 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn election_emits_persist_metadata() {
+        // test ensures that when an election is kicked off, the first action is a PersistMetadata
+        // and that there are no SendMessage actions before the PersistMetadata to keep our
+        // contract
+        let mut cluster = TestCluster::new(&[1, 2, 3]);
+        cluster.tick_until_candidate(1);
+        let actions = cluster.tick_node(1);
+
+        match actions[0] {
+            Action::PersistMetadata { term, voted_for } => {
+                assert_eq!(term, 1);
+                assert_eq!(voted_for, Some(1));
+            }
+            _ => panic!("First Action is NOT PersistMetadata"),
+        }
+    }
+
+    #[test]
+    fn grant_vote_emits_persist_metadata() {
+        // test ensures that when a node grants a vote, that it will first emit a PersistMetadata
+        // Action to persist the vote on new term
+        let mut cluster = TestCluster::new(&[1, 2, 3]);
+        cluster.tick_until_candidate(1);
+        let actions = cluster.tick_node(1);
+        // can't leverage the TestCluster too much because it disables the ability to ensure
+        // PersistMetadata happens before SendMessage
+        let node2_act = actions
+            .iter()
+            .filter(|action| match action {
+                Action::SendMessage { target, message: _ } => *target == 2,
+                _ => false,
+            })
+            .take(1)
+            .next()
+            .unwrap();
+        let node2_msg = match node2_act {
+            Action::SendMessage {
+                target: _,
+                message: Message::RequestVote(msg),
+            } => msg,
+            _ => panic!("No SendMessage for Node 2!"),
+        };
+        let node2_actions = cluster.node_mut(2).handle_request_vote(node2_msg.clone());
+
+        // because of the way it is setup, the first Action will be PersistMetadata with a
+        // voted_for as None (because node2 is on term 0 and check_msg_term will increment the term
+        // and set voted_for to None). the second Action is going to be the actual vote after
+        // handle_request_vote makes its way through. we check that here
+        match node2_actions[0] {
+            Action::PersistMetadata { term, voted_for } => {
+                assert_eq!(term, 1);
+                assert_eq!(voted_for, None);
+            }
+            _ => panic!("First Action is NOT PersistMetadata"),
+        };
+        match node2_actions[1] {
+            Action::PersistMetadata { term, voted_for } => {
+                assert_eq!(term, 1);
+                assert_eq!(voted_for, Some(1));
+            }
+            _ => panic!("Second Action is NOT PersistMetadata"),
+        };
+    }
+
+    #[test]
+    fn propose_emits_persist_log() {
+        // this test ensures that when a leader proposes a new command to be added to the log, the
+        // first Action is a PersistLogEntries Action to add that new entry
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+        // propose the command. note that the new command to be added is at index 2
+        let actions = cluster.node_mut(1).propose(DUMMY.to_vec()).unwrap();
+        match &actions[0] {
+            Action::PersistLogEntries {
+                start_index,
+                entries,
+            } => {
+                assert_eq!(*start_index, 2);
+                assert_eq!(
+                    entries,
+                    &[LogEntry {
+                        term: 1,
+                        command: DUMMY.to_vec()
+                    }]
+                    .to_vec()
+                );
+            }
+            _ => panic!("First Action is NOT PersistLogEntries"),
+        }
+    }
+
+    #[test]
+    fn follower_append_emits_persist_log() {
+        // this test ensures that when a follower appends a new entry to their log (upon receiving
+        // AppendEntries RPC), that the follower persists that entry
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+        // propose the command and grab the AppendEntries messages
+        let actions = cluster.node_mut(1).propose(DUMMY.to_vec()).unwrap();
+        // get node2's SendMessage Action to deliver to node2
+        let node2_msg = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendMessage {
+                    target: 2,
+                    message: Message::AppendEntries(req),
+                } => Some(req),
+                _ => None,
+            })
+            .take(1)
+            .next()
+            .unwrap();
+        let node3_msg = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendMessage {
+                    target: 3,
+                    message: Message::AppendEntries(req),
+                } => Some(req),
+                _ => None,
+            })
+            .take(1)
+            .next()
+            .unwrap();
+
+        let node2_actions = cluster.node_mut(2).handle_append_entries(node2_msg.clone());
+        let node3_actions = cluster.node_mut(3).handle_append_entries(node3_msg.clone());
+
+        match &node2_actions[0] {
+            Action::PersistLogEntries {
+                start_index,
+                entries,
+            } => {
+                assert_eq!(*start_index, 2);
+                assert_eq!(
+                    entries,
+                    &[LogEntry {
+                        term: 1,
+                        command: DUMMY.to_vec()
+                    }]
+                    .to_vec()
+                );
+            }
+            _ => panic!("First Action for node 2 is NOT PersistLogEntries"),
+        }
+
+        match &node3_actions[0] {
+            Action::PersistLogEntries {
+                start_index,
+                entries,
+            } => {
+                assert_eq!(*start_index, 2);
+                assert_eq!(
+                    entries,
+                    &[LogEntry {
+                        term: 1,
+                        command: DUMMY.to_vec()
+                    }]
+                    .to_vec()
+                );
+            }
+            _ => panic!("First Action for node 3 is NOT PersistLogEntries"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_no_persist() {
+        // the leader and the followers should not put out a PersistLogEntries Action with an
+        // empty heartbeat message because there is nothing to persist or add to the log
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+
+        cluster.tick_until_heartbeat(1);
+        let actions = cluster.tick_node(1);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    Action::PersistLogEntries {
+                        start_index: _,
+                        entries: _
+                    }
+                ))
+                .count(),
+            0
+        );
+
+        cluster.collect_actions(1, actions);
+        let node_actions = cluster.deliver_all();
+        for (_id, actions) in node_actions {
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(
+                        a,
+                        Action::PersistLogEntries {
+                            start_index: _,
+                            entries: _
+                        }
+                    ))
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn leader_election_emits_persist_log() {
+        let mut cluster = TestCluster::new(&[1, 2, 3]);
+        // get node1 to start an election
+        cluster.tick_until_candidate(1);
+        let actions = cluster.tick_node(1);
+        // get the messages queued in pending
+        cluster.collect_actions(1, actions);
+        // deliver to followers
+        cluster.deliver_all();
+        // get the RequestVoteResponse back to the leader to have the leader win the election
+        let actions = cluster.deliver_all();
+
+        // ensure that there is a PersistLogEntries Action for node 1
+        let leader_actions = actions.get(&1).unwrap();
+        match &leader_actions[0] {
+            Action::PersistLogEntries { start_index, entries } => {
+                assert_eq!(*start_index, 1);
+                assert_eq!(entries, &[LogEntry { term: 1, command: vec![] }].to_vec());
+            },
+            _ => panic!("No PersistLogEntries for leader after winning election and appending the dummy entry")
+        }
     }
 }

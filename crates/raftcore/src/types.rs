@@ -11,8 +11,21 @@ pub type NodeId = u64;
 
 #[derive(Debug)]
 pub enum Action {
-    SendMessage { target: NodeId, message: Message },
-    ApplyToStateMachine { command: Vec<u8> },
+    SendMessage {
+        target: NodeId,
+        message: Message,
+    },
+    ApplyToStateMachine {
+        command: Vec<u8>,
+    },
+    PersistMetadata {
+        term: u64,
+        voted_for: Option<NodeId>,
+    },
+    PersistLogEntries {
+        start_index: u64,
+        entries: Vec<LogEntry>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,7 +53,7 @@ pub struct RequestVoteResponseRPC {
 }
 
 /// An entry in the log
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub term: u64,
     /// Serialized version of the command
