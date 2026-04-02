@@ -94,4 +94,10 @@ pub struct AppendEntriesResponseRPC {
 
     /// Whether the node has an entry at prev_log_index with prev_log_term
     pub success: bool,
+
+    /// Optional index of first log entry that contains a conflicting term
+    pub first_conflicting_index: Option<u64>,
+
+    /// Optional term for that conflicting index
+    pub first_conflicting_term: Option<u64>,
 }

@@ -212,7 +212,11 @@ impl RaftCore {
         let default = self.log.len() as u64;
         let peer_next_index = self.next_index.get(&peer).unwrap_or(&default);
         // the last index the peer should have seen from our log
-        let prev_log_index = *peer_next_index - 1;
+        let prev_log_index = if *peer_next_index > 0 {
+            *peer_next_index - 1
+        } else {
+            0
+        };
         let prev_log_term = self.log[prev_log_index as usize].term;
 
         // grab the entries at the next place we think the peer needs it
@@ -398,15 +402,21 @@ impl RaftCore {
             actions.extend(persist_actions);
         }
 
-        let false_response = Message::AppendEntriesResponse(types::AppendEntriesResponseRPC {
+        let mut response = types::AppendEntriesResponseRPC {
             id: self.id,
             term: self.current_term,
             match_index: self.log.len() as u64 - 1,
             success: false,
-        });
-        let false_action = Action::SendMessage {
-            target: req.leader_id,
-            message: false_response,
+            first_conflicting_index: None,
+            first_conflicting_term: None,
+        };
+
+        let make_response = |r: types::AppendEntriesResponseRPC| {
+            let false_response = Message::AppendEntriesResponse(r);
+            Action::SendMessage {
+                target: req.leader_id,
+                message: false_response,
+            }
         };
 
         // check if we are a candidate and step down if the term is at least as big as ours
@@ -421,13 +431,13 @@ impl RaftCore {
         // ensure we are a follower
         if self.state != RaftState::Follower {
             // send nothing if we are a leader or candidate
-            actions.push(false_action);
+            actions.push(make_response(response));
             return actions;
         }
 
         if req.term < self.current_term {
             // "Leader" is on an earlier term, so we send back a false response
-            actions.push(false_action);
+            actions.push(make_response(response));
             return actions;
         }
 
@@ -440,7 +450,26 @@ impl RaftCore {
             || (req.prev_log_index < self.log.len() as u64
                 && self.log[req.prev_log_index as usize].term == req.prev_log_term);
         if !valid {
-            actions.push(false_action);
+            actions.push(if req.prev_log_index >= self.log.len() as u64 {
+                // this node's log is too short, so there isn't a conflicting term, we just need a
+                // lot to catch up
+                response.first_conflicting_index = Some(self.log.len() as u64);
+                make_response(response)
+            } else {
+                // this node's log has a conflicting term at this index, so we backtrack until we
+                // find an entry that is less than the term at the current index
+                let conflicting_term = self.log[req.prev_log_index as usize].term;
+                let mut conflicting_index = None;
+                for i in (0..req.prev_log_index as usize).rev() {
+                    if self.log[i].term != conflicting_term {
+                        conflicting_index = Some(i as u64 + 1);
+                        break;
+                    }
+                }
+                response.first_conflicting_index = conflicting_index;
+                response.first_conflicting_term = Some(conflicting_term);
+                make_response(response)
+            });
             return actions;
         }
 
@@ -502,6 +531,8 @@ impl RaftCore {
                 term: self.current_term,
                 match_index: self.log.len() as u64 - 1,
                 success: true,
+                first_conflicting_term: None,
+                first_conflicting_index: None,
             }),
         });
         actions
@@ -522,8 +553,13 @@ impl RaftCore {
             let _ = self.match_index.insert(resp.id, resp.match_index);
             let _ = self.next_index.insert(resp.id, resp.match_index + 1);
         } else {
-            // now we have to decrement next_index for this client and try the AppendEntries again
-            self.next_index.entry(resp.id).and_modify(|v| *v -= 1);
+            // we will update the next index to be the first conflict that the node sent us (if
+            // applicable), otherwise we decrement by 1
+            if let Some(ind) = resp.first_conflicting_index {
+                self.next_index.entry(resp.id).and_modify(|v| *v = ind);
+            } else {
+                self.next_index.entry(resp.id).and_modify(|v| *v = 0);
+            }
             actions.push(self.build_append_entries_for_peer(resp.id));
             return actions;
         };
@@ -2001,86 +2037,124 @@ mod tests {
     fn follower_well_behind() {
         // this test attempts to get a follower back up to speed with the rest of the cluster
         // we'll have a follower that never gets any log entries need to catchup
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        make_leader(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-        );
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+        // every node's log looks like this after leader election:
+        //    0     1     2
+        //  ----- ----- -----
+        // |     |     |     |
+        // | t:0 | t:1 |     |
+        // |     |     |     |
+        //  ----- ----- -----
 
-        // leader gets dummy entries at index 1, 2 on term 1 (so does node3)
+        // have node1 and 3 progress with node2 falling behind and having different entries
         let mut entry = LogEntry {
             term: 1,
             command: DUMMY.to_vec(),
         };
-        node1.log.extend([entry.clone(), entry.clone()]);
-        node3.log.extend([entry.clone(), entry.clone()]);
+        cluster
+            .node_mut(1)
+            .log
+            .extend([entry.clone(), entry.clone(), entry.clone()]);
+        cluster
+            .node_mut(3)
+            .log
+            .extend([entry.clone(), entry.clone(), entry]);
+        // node2 will NOT get these entries, but have its next_index set to the same as node3's
+        // node1 and node3 log now looks like this:
+        //    0     1     2     3     4
+        //  ----- ----- ----- ----- -----
+        // |     |     |     |     |     |
+        // | t:0 | t:1 | t:1 | t:1 | t:1 |
+        // |     |     |     |     |     |
+        //  ----- ----- ----- ----- -----
 
-        // node2 will get entries at 1, 2, 3
-        entry.term = 0;
-        node2.log.extend([entry.clone(), entry.clone(), entry]);
+        cluster
+            .node_mut(1)
+            .next_index
+            .entry(2)
+            .and_modify(|v| *v = 5);
+        cluster
+            .node_mut(1)
+            .next_index
+            .entry(3)
+            .and_modify(|v| *v = 5);
 
-        // update next_index on node1 to have 2 and 3 as "3" (we're testing if node2 catches up
-        // with the new entries)
-        node1.next_index.entry(2).and_modify(|v| *v = 3);
-        node1.next_index.entry(3).and_modify(|v| *v = 3);
+        // get a heartbeat out and deliver to followers
+        cluster.tick_until_heartbeat(1);
+        let actions = cluster.tick_node(1);
+        cluster.collect_actions(1, actions);
+        cluster.deliver_all();
 
-        // trigger a heartbeat from node1 to send out append entries
-        node1.ticks_since_last_heartbeat = node1.heartbeat_interval;
-        let actions = node1.heartbeat();
-        let append_entries = extract_append_entries(actions);
-        // deliver to node2 and 3
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-        // check that node2 denied the request
+        // node 2 should have denied the requst and set the first conflicting entry to 2 (because
+        // the prev_log_index is less than the log length of node2)
         assert_eq!(
-            responses
+            cluster
+                .pending_messages
                 .iter()
-                .filter(|(_, msg)| msg.id == 2 && !msg.success)
+                .filter(|(from, _, msg)| {
+                    match msg {
+                        Message::AppendEntriesResponse(resp) => {
+                            *from == 2 && !resp.success && resp.first_conflicting_index == Some(2)
+                        }
+                        _ => false,
+                    }
+                })
                 .count(),
             1
         );
 
-        // when we deliver the appendentries responses to the leader, we should get the actions
-        // because we'll decrement node2's prev_log_index
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
-        assert_eq!(*node1.next_index.get(&2).unwrap(), 2);
-        let append_entries = extract_append_entries(actions);
-        // there's only AppendEntries
-        assert_eq!(append_entries[0].1.prev_log_index, 1);
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
-        // now, node2's next_index should be 1 (which means prev_log_index in the below
-        // append_entries is 0)
-        assert_eq!(*node1.next_index.get(&2).unwrap(), 1);
-        let append_entries = extract_append_entries(actions);
-        assert_eq!(append_entries[0].1.prev_log_index, 0);
-
-        // when we deliver this one should work
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-        // check we have a success from node2
+        // deliver to the leader, leader should have updated next_index to 2 for node2 AND sent an
+        // AppendEntries with prev_log_index == 1 and entries.len() == 3
+        cluster.deliver_all();
+        assert_eq!(*cluster.node(1).next_index.get(&2).unwrap(), 2);
         assert_eq!(
-            responses
+            cluster
+                .pending_messages
                 .iter()
-                .filter(|(_, msg)| msg.id == 2 && msg.success)
+                .filter(|(from, to, msg)| {
+                    match msg {
+                        Message::AppendEntries(req) => {
+                            *from == 1
+                                && *to == 2
+                                && req.prev_log_index == 1
+                                && req.entries.len() == 3
+                        }
+                        _ => false,
+                    }
+                })
                 .count(),
             1
         );
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
-        // should not have actions to take now
-        assert!(actions.is_empty());
 
-        // check node2's log matches node1's
+        // final deliver to node2
+        // check node2 responds with success and that the logs match
+        cluster.deliver_all();
         assert_eq!(
-            node1.log.iter().map(|entry| entry.term).collect::<Vec<_>>(),
-            node2.log.iter().map(|entry| entry.term).collect::<Vec<_>>()
+            cluster
+                .pending_messages
+                .iter()
+                .filter(|(from, _to, msg)| {
+                    match msg {
+                        Message::AppendEntriesResponse(resp) => *from == 2 && resp.success,
+                        _ => false,
+                    }
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            cluster
+                .node(1)
+                .log
+                .iter()
+                .map(|entry| entry.term)
+                .collect::<Vec<_>>(),
+            cluster
+                .node(2)
+                .log
+                .iter()
+                .map(|entry| entry.term)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2089,71 +2163,112 @@ mod tests {
         // this test shows a follower that may have been a previous leader and never was able to
         // commit its entries, it will have 3 extra entries on term 0 and need to get its log
         // truncated
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        make_leader(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-        );
-
-        // leader gets dummy entries at index 1 on term 1 (so does node3)
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
+        // leader gets dummy entry at index 2 on term 1 (so does node3)
         let mut entry = LogEntry {
             term: 1,
             command: DUMMY.to_vec(),
         };
-        node1.log.extend([entry.clone()]);
-        node3.log.extend([entry.clone()]);
+        cluster.node_mut(1).log.extend([entry.clone()]);
+        cluster.node_mut(3).log.extend([entry.clone()]);
 
         // node2 will get entries at 1, 2, 3 on term 0
         entry.term = 0;
-        node2.log.extend([entry.clone(), entry.clone(), entry]);
+        cluster
+            .node_mut(2)
+            .log
+            .extend([entry.clone(), entry.clone(), entry]);
 
-        // update next_index on node1 to have 2 and 3 as "2"
-        node1.next_index.entry(2).and_modify(|v| *v = 2);
-        node1.next_index.entry(3).and_modify(|v| *v = 2);
+        // update next_index on node1 to have 2 and 3 as "3" (what the leader believes their next
+        // index should be based on its own log)
+        cluster
+            .node_mut(1)
+            .next_index
+            .entry(2)
+            .and_modify(|v| *v = 3);
+        cluster
+            .node_mut(1)
+            .next_index
+            .entry(3)
+            .and_modify(|v| *v = 3);
 
-        // send one appendentries and give back to leader, updates node2's next index to 1
-        // send one more and should have node2 truncate its log and be up to speed
-        node1.ticks_since_last_heartbeat = node1.heartbeat_interval;
-        let actions = node1.heartbeat();
-        let append_entries = extract_append_entries(actions);
-        // deliver to node2 and 3
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-        // check that node2 denied the request
+        cluster.tick_until_heartbeat(1);
+        // should have a heartbeat with AppendEntries
+        let actions = cluster.node_mut(1).tick();
+        // send the messages
+        cluster.collect_actions(1, actions);
+        // deliver to followers
+        cluster.deliver_all();
+        // check that node2 sent back a false response with first conflicting index at index 2
         assert_eq!(
-            responses
+            cluster
+                .pending_messages
                 .iter()
-                .filter(|(_, msg)| msg.id == 2 && !msg.success)
+                .filter(|(from, _to, msg)| {
+                    match msg {
+                        Message::AppendEntriesResponse(resp) => {
+                            *from == 2 && !resp.success && resp.first_conflicting_index == Some(2)
+                        }
+                        _ => false,
+                    }
+                })
                 .count(),
             1
         );
 
-        // when we deliver the appendentries responses to the leader, we should get the actions
-        // because we'll decrement node2's prev_log_index
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
-        assert_eq!(*node1.next_index.get(&2).unwrap(), 1);
-        let append_entries = extract_append_entries(actions);
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-        // now node2 should respond successfully
+        // deliver the responses to the leadership
+        cluster.deliver_all();
+        // leader should now have next_index for node2 set to 2 and sent out an append entries with
+        // prev_log_index == 1 and 1 entry to add to the log (index 2 entry)
+        assert_eq!(*cluster.node(1).next_index.get(&2).unwrap(), 2);
         assert_eq!(
-            responses
+            cluster
+                .pending_messages
                 .iter()
-                .filter(|(_, msg)| msg.id == 2 && msg.success)
+                .filter(|(from, to, msg)| {
+                    match msg {
+                        Message::AppendEntries(req) => {
+                            *from == 1
+                                && *to == 2
+                                && req.prev_log_index == 1
+                                && req.entries.len() == 1
+                        }
+                        _ => false,
+                    }
+                })
                 .count(),
             1
         );
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
-        // actions should be empty (node2 up to date)
-        assert!(actions.is_empty());
-        // and node1 and node2's logs should match
+
+        // deliver to node2 and check that node2 responded with success and that the logs match now
+        // (based on terms)
+        cluster.deliver_all();
         assert_eq!(
-            node1.log.iter().map(|entry| entry.term).collect::<Vec<_>>(),
-            node2.log.iter().map(|entry| entry.term).collect::<Vec<_>>()
+            cluster
+                .pending_messages
+                .iter()
+                .filter(|(_, to, msg)| {
+                    match msg {
+                        Message::AppendEntriesResponse(resp) => *to == 1 && resp.success,
+                        _ => false,
+                    }
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            cluster
+                .node(1)
+                .log
+                .iter()
+                .map(|entry| entry.term)
+                .collect::<Vec<_>>(),
+            cluster
+                .node(2)
+                .log
+                .iter()
+                .map(|entry| entry.term)
+                .collect::<Vec<_>>()
         );
     }
 
