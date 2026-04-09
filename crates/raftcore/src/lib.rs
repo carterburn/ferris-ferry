@@ -70,6 +70,10 @@ struct RaftCore {
     // --- End Leader Volatile State ---
     votes_received: HashSet<NodeId>,
 
+    // --- Snapshot / log compaction support ---
+    last_included_index: u64,
+    last_included_term: u64,
+
     ticks_since_last_heartbeat: u64,
     election_timeout_range: Range<u64>,
     election_timeout: u64,
@@ -101,10 +105,7 @@ impl RaftCore {
         let peers: Vec<NodeId> = nodes.iter().filter(|x| **x != id).copied().collect();
         let num_peers = peers.len();
         // add dummy entry to the log to make it 0-indexed
-        let log = Vec::from([LogEntry {
-            term: 0,
-            command: vec![],
-        }]);
+        let log = Vec::new();
 
         let election_timeout = rng.random_range(election_range.clone());
 
@@ -120,6 +121,8 @@ impl RaftCore {
             next_index: HashMap::with_capacity(num_peers),
             match_index: HashMap::with_capacity(num_peers),
             votes_received: HashSet::new(),
+            last_included_index: 0,
+            last_included_term: 0,
             ticks_since_last_heartbeat: 0,
             election_timeout_range: election_range,
             election_timeout,
@@ -128,7 +131,9 @@ impl RaftCore {
     }
 
     /// Restore this Raft Node from a persistent state. This will restore if a node has crashed the
-    /// current_term, voted_for, and log.
+    /// current_term, voted_for, and log. This does not take into account any snapshots, that would
+    /// be restored slightly differently and this constructor would be used once the snapshot has
+    /// been applied / adjusted.
     ///
     /// Arguments:
     /// - id: This node's ID.
@@ -157,6 +162,60 @@ impl RaftCore {
         node
     }
 
+    /// Returns the logical index of the last entry including snapshots.
+    fn last_log_index(&self) -> u64 {
+        self.last_included_index + self.log.len() as u64
+    }
+
+    /// Returns a reference to the Entry at a given logical index
+    fn log_entry_at(&self, index: u64) -> Option<&LogEntry> {
+        if index <= self.last_included_index {
+            None
+        } else {
+            // index is somewhere in the in-memory log (if last_included_index is 100, then index
+            // 101 is at index 0 in the in-memory log, so if the index we're interested in is 102,
+            //     102 - 100 == 2, but that entry is at index 1)
+            let adjusted_index = (index - self.last_included_index - 1) as usize;
+            if adjusted_index >= self.log.len() {
+                None
+            } else {
+                Some(&self.log[adjusted_index])
+            }
+        }
+    }
+
+    /// Returns the term at a given logical log index
+    fn log_term_at(&self, index: u64) -> Option<u64> {
+        if index < self.last_included_index {
+            None
+        } else if index == self.last_included_index {
+            Some(self.last_included_term)
+        } else {
+            Some(self.log_entry_at(index)?.term)
+        }
+    }
+
+    /// Returns the term of the last entry in the log.
+    fn last_log_term(&self) -> u64 {
+        // We can unwrap here because we know that self.last_log_index() will return a valid index
+        self.log_term_at(self.last_log_index()).unwrap()
+    }
+
+    /// Returns a slice of entries between the logical indices with `to` being exclusive
+    /// Note: if a non-empty slice is returned from this method, it is guaranteed that the first
+    /// entry in the slice is at index _from_. It does not guarantee that all requested entries
+    /// will be returned (if, for example, to is far greater than the actual length of the log).
+    fn log_slice(&self, from: u64, to: u64) -> &[LogEntry] {
+        // We can only slice after last_included_index
+        if from <= self.last_included_index {
+            return &[];
+        }
+        // adjust to get a real index in the in-memory log
+        let from = from - self.last_included_index - 1;
+        let to = (to - self.last_included_index - 1).min(self.log.len() as u64);
+        &self.log[from as usize..to as usize]
+    }
+
     /// The method used for client's to interact with the Raft cluster.
     pub fn propose(&mut self, command: Vec<u8>) -> Option<Vec<Action>> {
         if self.state != RaftState::Leader {
@@ -173,9 +232,11 @@ impl RaftCore {
         self.ticks_since_last_heartbeat = 0;
 
         // send out append entries to peers
+        let last_log_index = self.last_log_index();
+        let entries = self.log_slice(last_log_index, last_log_index + 1);
         let mut actions = vec![Action::PersistLogEntries {
-            start_index: self.log.len() as u64 - 1,
-            entries: self.log[self.log.len() - 1..].to_vec(),
+            start_index: last_log_index,
+            entries: entries.to_vec(),
         }];
         actions.extend(self.append_entries());
         Some(actions)
@@ -209,7 +270,7 @@ impl RaftCore {
 
     fn build_append_entries_for_peer(&self, peer: NodeId) -> Action {
         // the next index that the peer needs to be aware of from our tracking
-        let default = self.log.len() as u64;
+        let default = self.last_log_index();
         let peer_next_index = self.next_index.get(&peer).unwrap_or(&default);
         // the last index the peer should have seen from our log
         let prev_log_index = if *peer_next_index > 0 {
@@ -217,10 +278,12 @@ impl RaftCore {
         } else {
             0
         };
-        let prev_log_term = self.log[prev_log_index as usize].term;
+        // SAFETY: We can unwrap() here because we always control next_index and it is originally
+        // based on self.last_included_index()
+        let prev_log_term = self.log_term_at(prev_log_index).unwrap();
 
         // grab the entries at the next place we think the peer needs it
-        let entries = &self.log[*peer_next_index as usize..];
+        let entries = self.log_slice(*peer_next_index, self.last_log_index() + 1);
         let msg = Message::AppendEntries(AppendEntriesRPC {
             term: self.current_term,
             leader_id: self.id,
@@ -265,10 +328,8 @@ impl RaftCore {
             let request = RequestVoteRPC {
                 term: self.current_term,
                 candidate_id: self.id,
-                // SAFETY: the dummy command is added in Self::new so self.log.len() is always at
-                // least 1
-                last_log_index: self.log.len() as u64 - 1,
-                last_log_term: self.log[self.log.len() - 1].term,
+                last_log_index: self.last_log_index(),
+                last_log_term: self.last_log_term(),
             };
             let msg = Message::RequestVote(request);
             actions.extend(self.peers.iter().map(|peer_id| Action::SendMessage {
@@ -332,8 +393,8 @@ impl RaftCore {
             Some(id) if id == req.candidate_id => true,
             Some(_) => false,
         };
-        let last_log_index = self.log.len() as u64 - 1;
-        let last_log_term = self.log[self.log.len() - 1].term;
+        let last_log_index = self.last_log_index();
+        let last_log_term = self.last_log_term();
         // candidate's log must have a higher term or (if terms are equal) an index at least as
         // long as us
         let log_check = req.last_log_term > last_log_term
@@ -405,7 +466,7 @@ impl RaftCore {
         let mut response = types::AppendEntriesResponseRPC {
             id: self.id,
             term: self.current_term,
-            match_index: self.log.len() as u64 - 1,
+            match_index: self.last_log_index(),
             success: false,
             first_conflicting_index: None,
             first_conflicting_term: None,
@@ -447,22 +508,27 @@ impl RaftCore {
         // ensure that the previous log index is actually less than our current length and at the
         // log index (the last the leader was tracking for us) matches the term
         let valid = req.prev_log_index == 0
-            || (req.prev_log_index < self.log.len() as u64
-                && self.log[req.prev_log_index as usize].term == req.prev_log_term);
+            || (req.prev_log_index <= self.last_log_index()
+                // we shouldn't unwrap here because there could be a bad index in the request so
+                // instead we'll wrap the request's term in Some and if log_term_at returns None,
+                // the equality check will fail 
+                && self.log_term_at(req.prev_log_index) == Some(req.prev_log_term));
         if !valid {
-            actions.push(if req.prev_log_index >= self.log.len() as u64 {
+            actions.push(if req.prev_log_index > self.last_log_index() {
                 // this node's log is too short, so there isn't a conflicting term, we just need a
                 // lot to catch up
-                response.first_conflicting_index = Some(self.log.len() as u64);
+                response.first_conflicting_index = Some(self.last_log_index() + 1);
                 make_response(response)
             } else {
                 // this node's log has a conflicting term at this index, so we backtrack until we
                 // find an entry that is less than the term at the current index
-                let conflicting_term = self.log[req.prev_log_index as usize].term;
+                let conflicting_term = self.log_term_at(req.prev_log_index).unwrap_or(0);
                 let mut conflicting_index = None;
-                for i in (0..req.prev_log_index as usize).rev() {
-                    if self.log[i].term != conflicting_term {
-                        conflicting_index = Some(i as u64 + 1);
+                for i in (0..req.prev_log_index).rev() {
+                    // 0 as the fallback is good because that should NEVER happen
+                    let entry_term = self.log_term_at(i).unwrap_or(0);
+                    if entry_term != conflicting_term {
+                        conflicting_index = Some(i + 1);
                         break;
                     }
                 }
@@ -484,12 +550,15 @@ impl RaftCore {
             // check if i is less than length of log. if it is equal then we will just be appending
             // to the log. it can't be greater because that check is done above with the if !valid
             // check
-            if i < self.log.len() {
+            if i <= self.last_log_index() as usize {
                 // this is an existing entry, check if it has the same term
-                if self.log[i].term != new_entry.term {
+                // SAFETY: this unwrap is ok because i must be < last_log_index to be here
+                if self.log_term_at(i as u64).unwrap() != new_entry.term {
                     // set the log to be everything up to put not including i (keep first i
                     // elements)
-                    self.log.truncate(i);
+                    // we only truncate the in-memory log from the adjusted index (not including
+                    // snapshotted entries)
+                    self.log.truncate(i - self.last_included_index as usize - 1);
                 } else {
                     // same index and same term, so it's the same entry. just move on
                     continue;
@@ -503,19 +572,21 @@ impl RaftCore {
 
         // if log has changed (had entries) persist the entries starting from req.prev_log_index + 1
         if !req.entries.is_empty() {
+            let persist_entries = self.log_slice(req.prev_log_index + 1, self.last_log_index() + 1);
             actions.push(Action::PersistLogEntries {
                 start_index: req.prev_log_index + 1,
-                entries: self.log[req.prev_log_index as usize + 1..].to_vec(),
+                entries: persist_entries.to_vec(),
             });
         }
 
         // update our commit index
         if req.leader_commit > self.commit_index {
             let old_commit = self.commit_index;
-            self.commit_index = min(req.leader_commit, self.log.len() as u64 - 1);
+            self.commit_index = min(req.leader_commit, self.last_log_index());
             // we should apply all of the entries between old_commit and the new commit_index
+            let apply_entries = self.log_slice(old_commit + 1, self.commit_index + 1);
             actions.extend(
-                self.log[old_commit as usize + 1..=self.commit_index as usize]
+                apply_entries
                     .iter()
                     .map(|entry| Action::ApplyToStateMachine {
                         command: entry.command.clone(),
@@ -529,7 +600,7 @@ impl RaftCore {
             message: Message::AppendEntriesResponse(AppendEntriesResponseRPC {
                 id: self.id,
                 term: self.current_term,
-                match_index: self.log.len() as u64 - 1,
+                match_index: self.last_log_index(),
                 success: true,
                 first_conflicting_term: None,
                 first_conflicting_index: None,
@@ -566,8 +637,8 @@ impl RaftCore {
 
         // grab the minimum value that a majority of servers has in their match_index
         let mut peer_indices: Vec<u64> = self.match_index.values().copied().collect();
-        // add leader's highest index we have in the log (self.log.len())
-        peer_indices.push(self.log.len() as u64 - 1);
+        // add leader's highest index we have in the log
+        peer_indices.push(self.last_log_index());
         // sort them
         peer_indices.sort();
         // pick out the value that has been matched on a majority of servers
@@ -575,17 +646,21 @@ impl RaftCore {
         let prev_commit_index = self.commit_index;
         // find the highest index in our log where index.term == current_term
         let mut new_commit = prev_commit_index;
-        for index in prev_commit_index as usize + 1..=replicated_index as usize {
-            if self.log[index].term == self.current_term {
-                new_commit = index as u64;
+        for index in prev_commit_index + 1..replicated_index + 1 {
+            // SAFETY: index ranges from prev_commit_index + 1 (known to be safe given we received
+            // a response and that a previous committed index must be present) and replicated_index
+            // which must all be within the log
+            if self.log_term_at(index).unwrap() == self.current_term {
+                new_commit = index;
             }
         }
 
         // update commit index and apply all entries from last_applied to commit index
         self.commit_index = new_commit;
-        for index in self.last_applied as usize + 1..=self.commit_index as usize {
+        let entries = self.log_slice(self.last_applied + 1, self.commit_index + 1);
+        for entry in entries {
             actions.push(Action::ApplyToStateMachine {
-                command: self.log[index].command.clone(),
+                command: entry.command.clone(),
             });
         }
         self.last_applied = self.commit_index;
@@ -601,13 +676,14 @@ impl RaftCore {
         });
 
         for id in &self.peers {
-            self.next_index.insert(*id, self.log.len() as u64);
+            self.next_index.insert(*id, self.last_log_index() + 1);
             self.match_index.insert(*id, 0);
         }
 
+        let entries = self.log_slice(self.last_log_index(), self.last_log_index() + 1);
         Action::PersistLogEntries {
-            start_index: self.log.len() as u64 - 1,
-            entries: self.log[self.log.len() - 1..].to_vec(),
+            start_index: self.last_log_index(),
+            entries: entries.to_vec(),
         }
     }
 }
@@ -699,14 +775,12 @@ mod tests {
 
             // deliver append entries queued up
             let _ = self.deliver_all();
-            // get responses back to the leader (who will then commit)
+            // get responses back to the leader
             let _ = self.deliver_all();
             // all responses will FAIL because prev_log_index is 1 (based on leader's log)
 
             // do another append entries (heartbeat) to get followers synced and deliver the dummy
             // entry
-            let actions = self.node_mut(id).append_entries();
-            self.collect_actions(id, actions);
             let _ = self.deliver_all();
             // clear out pending with the responses to the heartbeat to start clean
             let _ = self.deliver_all();
@@ -1706,76 +1780,6 @@ mod tests {
     fn follower_commit_advancement() {
         // ensure that a follower advances its commit index when it has appended an entry to its
         // log and receives a new AppendEntries RPC (like a heartbeat, for example)
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        let actions = make_leader_with_actions(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-        );
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-        let actions = node1.append_entries();
-        append_entries_loop(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            actions,
-        );
-
-        let Some(actions) = node1.propose(DUMMY.to_vec()) else {
-            panic!("Node used to call propose not a leader");
-        };
-
-        let append_entries = extract_append_entries(actions);
-        // deliver append entries to the followers
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-
-        for (_, resp) in responses {
-            node1.handle_append_entries_response(resp);
-        }
-
-        // followers should have a commit_index of 1 (because of dummy entry)
-        assert_eq!(node2.commit_index, 1);
-        assert_eq!(node3.commit_index, 1);
-
-        // now, the leader will send out a heartbeat message and we should see all follower's
-        // commit_index move from 0 to 1
-        // manually set the heartbeat to fire
-        node1.ticks_since_last_heartbeat = node1.heartbeat_interval;
-        let heartbeat = node1.heartbeat();
-        let append_entries = extract_append_entries(heartbeat);
-        assert_eq!(append_entries.len(), 2);
-
-        // manually deliver the AppendEntries so we can verify that the followers give two actions
-        // in response (one send message and one apply to state machine)
-        for (id, msg) in append_entries {
-            let actions = if id == 2 {
-                node2.handle_append_entries(msg)
-            } else {
-                node3.handle_append_entries(msg)
-            };
-            assert_eq!(actions.len(), 2);
-            for a in actions {
-                match a {
-                    Action::SendMessage { target, message: _ } => {
-                        assert_eq!(target, node1.id);
-                    }
-                    Action::ApplyToStateMachine { command } => {
-                        assert_eq!(command, DUMMY.to_vec());
-                    }
-                    _ => panic!("Unexpected Action"),
-                }
-            }
-        }
-
-        // now that the followers received AppendEntries, they should have their commit_index set
-        // to 2
-        assert_eq!(node2.commit_index, 2);
-        assert_eq!(node3.commit_index, 2);
 
         // propose and sync a command across the cluster
         let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
@@ -1912,7 +1916,6 @@ mod tests {
         for (id, actions) in follower_actions {
             let mut cmd1 = false;
             let mut cmd2 = false;
-            println!("{actions:?}");
             assert_eq!(actions.len(), 2);
             for a in actions {
                 if let Action::ApplyToStateMachine { command } = a {
@@ -2019,9 +2022,10 @@ mod tests {
         let _ = cluster.deliver_all();
 
         // check node3 has the two entries in its log
-        assert_eq!(cluster.node(3).log.len(), 4);
-        assert_eq!(cluster.node(3).log[2].command, DUMMY.to_vec());
-        assert_eq!(cluster.node(3).log[3].command, second);
+        assert_eq!(cluster.node(3).log.len(), 3);
+        assert_eq!(cluster.node(3).last_log_index(), 3);
+        assert_eq!(cluster.node(3).log[1].command, DUMMY.to_vec());
+        assert_eq!(cluster.node(3).log[2].command, second);
         // and that next index for node3 is 4
         assert_eq!(
             *cluster
@@ -2277,72 +2281,97 @@ mod tests {
         // this test will have a three node cluster where node1 (leader) will have entries in term
         // 1 at index 1 and 2, node2 will have the same thing, and node3 will have a matching term
         //   in index 1, but a conflicting term in index 2. this will rectify the logs to match
-        let (mut node1, mut node2, mut node3) = init_three_node_noop_cluster();
-        make_leader(
-            &mut node1,
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-        );
+        let mut cluster = TestCluster::new_with_leader(&[1, 2, 3], 1);
 
-        // make the dummies for node1 and 2 at index 1 and 2
+        // make the dummies for node1 and 2 at logical index 2 and 3
         let mut entry = LogEntry {
             term: 1,
             command: DUMMY.to_vec(),
         };
-        node1.log.extend([entry.clone(), entry.clone()]);
-        node2.log.extend([entry.clone(), entry.clone()]);
-        // give node3 the entry at term 1 at index 1
-        node3.log.push(entry.clone());
-        // and one at index 2 with term 2
+        cluster
+            .node_mut(1)
+            .log
+            .extend([entry.clone(), entry.clone()]);
+        cluster
+            .node_mut(2)
+            .log
+            .extend([entry.clone(), entry.clone()]);
+        // give node3 the entry at term 1 at logical index 2
+        cluster.node_mut(3).log.push(entry.clone());
+        // and one at logical index 3 with term 2
         entry.term = 2;
-        node3.log.push(entry);
+        cluster.node_mut(3).log.push(entry);
 
-        // update next_index on node1 to have 2 and 3 as "3" (as long as node1's log)
-        node1.next_index.entry(2).and_modify(|v| *v = 3);
-        node1.next_index.entry(3).and_modify(|v| *v = 3);
+        // update next_index on node1 to have 2 and 3 as "4" (as long as node1's log)
+        cluster
+            .node_mut(1)
+            .next_index
+            .entry(2)
+            .and_modify(|v| *v = 4);
+        cluster
+            .node_mut(1)
+            .next_index
+            .entry(3)
+            .and_modify(|v| *v = 4);
 
         // send one appendentries and give back to leader, this will update node3's next_index to 2
         // send one more and should have node3 truncate its log and be up to speed
-        node1.ticks_since_last_heartbeat = node1.heartbeat_interval;
-        let actions = node1.heartbeat();
-        let append_entries = extract_append_entries(actions);
-        // deliver to node2 and 3
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
+        cluster.tick_until_heartbeat(1);
+        let actions = cluster.tick_node(1);
+        cluster.collect_actions(1, actions);
+        // deliver the heartbeat to followers
+        let _ = cluster.deliver_all();
         // check that node3 denied the request
-        assert_eq!(
-            responses
-                .iter()
-                .filter(|(_, msg)| msg.id == 3 && !msg.success)
-                .count(),
-            1
-        );
 
-        // when we deliver the appendentries responses to the leader, we should get the actions
-        // because we'll decrement node3's prev_log_index
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
-        assert_eq!(*node1.next_index.get(&3).unwrap(), 2);
-        let append_entries = extract_append_entries(actions);
-        let responses = deliver_append_entries(
-            HashMap::from([(2, &mut node2), (3, &mut node3)]),
-            append_entries,
-        );
-        // now node3 should respond successfully
         assert_eq!(
-            responses
+            cluster
+                .pending_messages
                 .iter()
-                .filter(|(_, msg)| msg.id == 3 && msg.success)
+                .filter(|(from, _, msg)| *from == 3
+                    && match msg {
+                        Message::AppendEntriesResponse(resp) => !resp.success,
+                        _ => false,
+                    })
                 .count(),
             1
         );
-        let actions = deliver_append_entries_responses_with_actions(&mut node1, responses);
-        // actions should be empty (node3 up to date)
-        assert!(actions.is_empty());
-        // and node1 and node3's logs should match
+        println!("{:?}", cluster.pending_messages);
+        // provide responses to leader
+        let _ = cluster.deliver_all();
+        println!("{:?}", cluster.pending_messages);
+        // check that the leader sets next_index to 3
+        assert_eq!(*cluster.node(1).next_index.get(&3).unwrap(), 3);
+        // make sure new messages have populated
+        assert!(!cluster.pending_messages.is_empty());
+
+        // deliver to ndoe3 and make sure node3 responds successfully
+        // and that the two logs match
+        let _ = cluster.deliver_all();
         assert_eq!(
-            node1.log.iter().map(|entry| entry.term).collect::<Vec<_>>(),
-            node3.log.iter().map(|entry| entry.term).collect::<Vec<_>>()
+            cluster
+                .pending_messages
+                .iter()
+                .filter(|(from, _, msg)| *from == 3
+                    && match msg {
+                        Message::AppendEntriesResponse(resp) => resp.success,
+                        _ => false,
+                    })
+                .count(),
+            1
+        );
+        assert_eq!(
+            cluster
+                .node(1)
+                .log
+                .iter()
+                .map(|entry| entry.term)
+                .collect::<Vec<_>>(),
+            cluster
+                .node(3)
+                .log
+                .iter()
+                .map(|entry| entry.term)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2688,4 +2717,263 @@ mod tests {
             _ => panic!("No PersistLogEntries for leader after winning election and appending the dummy entry")
         }
     }
+
+    // --- Logical index tests start
+    #[inline(always)]
+    fn fresh_node() -> RaftCore {
+        RaftCore::new(1, &[1, 2, 3], None, 15..31)
+    }
+
+    fn node_with_no_snapshot() -> RaftCore {
+        let mut node = RaftCore::new(1, &[1, 2, 3], None, 15..31);
+        node.log.extend([
+            LogEntry {
+                term: 1,
+                command: DUMMY.to_vec(),
+            },
+            LogEntry {
+                term: 1,
+                command: DUMMY.to_vec(),
+            },
+            LogEntry {
+                term: 2,
+                command: DUMMY.to_vec(),
+            },
+        ]);
+        node
+    }
+
+    fn node_with_snapshot_no_additional() -> RaftCore {
+        let mut node = RaftCore::new(1, &[1, 2, 3], None, 15..31);
+        node.last_included_index = 100;
+        node.last_included_term = 2;
+        node
+    }
+
+    fn node_with_snapshot_and_additional() -> RaftCore {
+        let mut node = RaftCore::new(1, &[1, 2, 3], None, 15..31);
+        node.last_included_index = 100;
+        node.last_included_term = 2;
+        node.log.extend([
+            // Logical index 101
+            LogEntry {
+                term: 2,
+                command: DUMMY.to_vec(),
+            },
+            // Logical index 102
+            LogEntry {
+                term: 3,
+                command: DUMMY.to_vec(),
+            },
+        ]);
+        node
+    }
+
+    #[test]
+    fn log_term_at_same_index() {
+        let node = node_with_snapshot_no_additional();
+        assert_eq!(
+            node.log_term_at(node.last_included_index),
+            Some(node.last_included_term)
+        );
+    }
+
+    #[test]
+    fn log_term_at_lower_index() {
+        let node = node_with_snapshot_no_additional();
+        assert_eq!(node.log_term_at(2), None);
+    }
+
+    #[test]
+    fn log_term_at_index_in_physical_log_with_snapshot() {
+        let node = node_with_snapshot_and_additional();
+        assert_eq!(node.log_term_at(101), Some(2));
+        assert_eq!(node.log_term_at(102), Some(3));
+    }
+
+    #[test]
+    fn log_term_at_index_in_physical_log() {
+        let node = node_with_no_snapshot();
+        assert_eq!(node.log_term_at(1), Some(1));
+        assert_eq!(node.log_term_at(3), Some(2));
+    }
+
+    #[test]
+    fn log_term_at_index_beyond() {
+        let node = node_with_no_snapshot();
+        assert_eq!(node.log_term_at(100), None);
+        let node = node_with_snapshot_no_additional();
+        assert_eq!(node.log_term_at(101), None);
+        let node = node_with_snapshot_and_additional();
+        assert_eq!(node.log_term_at(200), None);
+    }
+
+    #[test]
+    fn log_slice_no_snapshot() {
+        let node = node_with_no_snapshot();
+        // from == to -> empty slice
+        assert_eq!(node.log_slice(1, 1), &[]);
+
+        // single entry (at logical index 2)
+        assert_eq!(
+            node.log_slice(2, 3),
+            &[LogEntry {
+                term: 1,
+                command: DUMMY.to_vec()
+            }]
+        );
+        // range of entries (logical index 2 and 3)
+        assert_eq!(
+            node.log_slice(2, 4),
+            &[
+                LogEntry {
+                    term: 1,
+                    command: DUMMY.to_vec()
+                },
+                LogEntry {
+                    term: 2,
+                    command: DUMMY.to_vec()
+                }
+            ]
+        );
+        // asking for entries past the end of the log
+        assert_eq!(
+            node.log_slice(3, 5),
+            &[LogEntry {
+                term: 2,
+                command: DUMMY.to_vec()
+            }]
+        );
+        // full log
+        assert_eq!(
+            node.log_slice(node.last_included_index + 1, node.last_log_index() + 1),
+            &[
+                LogEntry {
+                    term: 1,
+                    command: DUMMY.to_vec(),
+                },
+                LogEntry {
+                    term: 1,
+                    command: DUMMY.to_vec(),
+                },
+                LogEntry {
+                    term: 2,
+                    command: DUMMY.to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn log_slice_snapshot_no_additional() {
+        let node = node_with_snapshot_no_additional();
+        // from == to
+        assert_eq!(node.log_slice(100, 100), &[]);
+        // from < last_included_index
+        assert_eq!(node.log_slice(99, 100), &[]);
+        // from == last_included_index
+        assert_eq!(node.log_slice(100, 101), &[]);
+        // from = last_included_index + 1, last_included_index + 2
+        assert_eq!(node.log_slice(101, 102), &[]);
+        // full log
+        assert_eq!(
+            node.log_slice(node.last_included_index + 1, node.last_log_index() + 1),
+            &[]
+        );
+    }
+
+    #[test]
+    fn log_slice_snapshot() {
+        let node = node_with_snapshot_and_additional();
+
+        // from == to
+        assert_eq!(node.log_slice(101, 101), &[]);
+        // single entry at index 101
+        assert_eq!(
+            node.log_slice(101, 102),
+            &[LogEntry {
+                term: 2,
+                command: DUMMY.to_vec()
+            }]
+        );
+        // entry at 101 and 102
+        assert_eq!(
+            node.log_slice(101, 103),
+            &[
+                // Logical index 101
+                LogEntry {
+                    term: 2,
+                    command: DUMMY.to_vec()
+                },
+                // Logical index 102
+                LogEntry {
+                    term: 3,
+                    command: DUMMY.to_vec()
+                },
+            ]
+        );
+        // from < last_included_index
+        assert_eq!(node.log_slice(99, 103), &[]);
+        // from == last_included_index
+        assert_eq!(node.log_slice(100, 101), &[]);
+        // to past end of log (last_log_index + 5)
+        assert_eq!(
+            node.log_slice(101, node.last_log_index() + 5),
+            [
+                // Logical index 101
+                LogEntry {
+                    term: 2,
+                    command: DUMMY.to_vec()
+                },
+                // Logical index 102
+                LogEntry {
+                    term: 3,
+                    command: DUMMY.to_vec()
+                },
+            ]
+        );
+        // full log
+        assert_eq!(
+            node.log_slice(node.last_included_index + 1, node.last_log_index() + 1),
+            [
+                // Logical index 101
+                LogEntry {
+                    term: 2,
+                    command: DUMMY.to_vec()
+                },
+                // Logical index 102
+                LogEntry {
+                    term: 3,
+                    command: DUMMY.to_vec()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn last_log_index() {
+        let node = fresh_node();
+        assert_eq!(node.last_log_index(), 0);
+        let node = node_with_no_snapshot();
+        assert_eq!(node.last_log_index(), 3);
+        let node = node_with_snapshot_no_additional();
+        //                                  this is the last_included_index
+        assert_eq!(node.last_log_index(), 100);
+        let node = node_with_snapshot_and_additional();
+        assert_eq!(node.last_log_index(), 102);
+    }
+
+    #[test]
+    fn last_log_term() {
+        let node = fresh_node();
+        assert_eq!(node.last_log_term(), 0);
+        let node = node_with_no_snapshot();
+        assert_eq!(node.last_log_term(), 2);
+        let node = node_with_snapshot_no_additional();
+        assert_eq!(node.last_log_term(), 2);
+        let node = node_with_snapshot_and_additional();
+        assert_eq!(node.last_log_term(), 3);
+    }
+
+    // --- Logical index tests end
 }
