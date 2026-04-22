@@ -26,6 +26,17 @@ pub enum Action {
         start_index: u64,
         entries: Vec<LogEntry>,
     },
+    SendInstallSnapshot {
+        target: NodeId,
+        term: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+    },
+    InstallSnapshot {
+        last_included_index: u64,
+        last_included_term: u64,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,6 +45,8 @@ pub enum Message {
     RequestVoteResponse(RequestVoteResponseRPC),
     AppendEntries(AppendEntriesRPC),
     AppendEntriesResponse(AppendEntriesResponseRPC),
+    InstallSnapshot(InstallSnapshotRPC),
+    InstallSnapshotResponse(InstallSnapshotResponseRPC),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,4 +113,25 @@ pub struct AppendEntriesResponseRPC {
 
     /// Optional term for that conflicting index
     pub first_conflicting_term: Option<u64>,
+}
+
+pub struct SnapshotMetadata {
+    pub last_applied: u64,
+    pub last_applied_term: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstallSnapshotRPC {
+    pub term: u64,
+    pub leader_id: NodeId,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstallSnapshotResponseRPC {
+    pub id: NodeId,
+    pub term: u64,
+    pub last_included_index: u64,
 }

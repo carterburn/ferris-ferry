@@ -5,8 +5,9 @@ use std::{
 };
 
 use crate::types::{
-    Action, AppendEntriesRPC, AppendEntriesResponseRPC, LogEntry, Message, NodeId, RaftState,
-    RequestVoteRPC, RequestVoteResponseRPC,
+    Action, AppendEntriesRPC, AppendEntriesResponseRPC, InstallSnapshotRPC,
+    InstallSnapshotResponseRPC, LogEntry, Message, NodeId, RaftState, RequestVoteRPC,
+    RequestVoteResponseRPC, SnapshotMetadata,
 };
 
 use rand::prelude::*;
@@ -268,6 +269,15 @@ impl RaftCore {
         }
     }
 
+    fn install_snapshot_for_peer(&self, peer: NodeId) -> Action {
+        Action::SendInstallSnapshot {
+            target: peer,
+            term: self.current_term,
+            last_included_index: self.last_included_index,
+            last_included_term: self.last_included_term,
+        }
+    }
+
     fn build_append_entries_for_peer(&self, peer: NodeId) -> Action {
         // the next index that the peer needs to be aware of from our tracking
         let default = self.last_log_index();
@@ -278,9 +288,10 @@ impl RaftCore {
         } else {
             0
         };
-        // SAFETY: We can unwrap() here because we always control next_index and it is originally
-        // based on self.last_included_index()
-        let prev_log_term = self.log_term_at(prev_log_index).unwrap();
+
+        let Some(prev_log_term) = self.log_term_at(prev_log_index) else {
+            return self.install_snapshot_for_peer(peer);
+        };
 
         // grab the entries at the next place we think the peer needs it
         let entries = self.log_slice(*peer_next_index, self.last_log_index() + 1);
@@ -686,6 +697,139 @@ impl RaftCore {
             entries: entries.to_vec(),
         }
     }
+
+    /// For an event loop to prepare to save a snapshot
+    /// Returns the information needed for a snapshot to be recorded. The caller should provide
+    /// this information back in complete_snapshot.
+    pub fn prepare_snapshot(&self) -> SnapshotMetadata {
+        // SAFETY: we know that there is a log term at the last applied index
+        SnapshotMetadata {
+            last_applied: self.last_applied,
+            last_applied_term: self.log_term_at(self.last_applied).unwrap(),
+        }
+    }
+
+    /// For an event loop to signal completion of writing a snapshot to disk. This method should
+    /// only be called when it has confirmed that the snapshot has been written to durable storage.
+    pub fn complete_snapshot(&mut self, metadata: SnapshotMetadata) {
+        // trunacte the log up to and including metadata.last_applied
+        if metadata.last_applied <= self.last_included_index {
+            // nothing to do
+            return;
+        }
+        drop(
+            self.log
+                .drain(..(metadata.last_applied - self.last_included_index) as usize),
+        );
+        // reset last_included_index
+        self.last_included_index = metadata.last_applied;
+        self.last_included_term = metadata.last_applied_term;
+    }
+
+    /// For a follower to handle a InstallSnapshotRPC
+    pub fn handle_install_snapshot(&mut self, req: InstallSnapshotRPC) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if let Some(persist_actions) = self.check_msg_term(req.term) {
+            actions.extend(persist_actions);
+        }
+
+        let bail_response = Message::InstallSnapshotResponse(InstallSnapshotResponseRPC {
+            id: self.id,
+            term: self.current_term,
+            last_included_index: self.last_included_index,
+        });
+
+        if req.term < self.current_term {
+            actions.push(Action::SendMessage {
+                target: req.leader_id,
+                message: bail_response,
+            });
+            return actions;
+        }
+
+        if req.term == self.current_term && self.state == RaftState::Candidate {
+            // step down to be a follower...
+            self.state = RaftState::Follower;
+        }
+
+        self.reset_election_timeout();
+
+        if req.last_included_index <= self.last_included_index {
+            // stale snapshot, just return
+            actions.push(Action::SendMessage {
+                target: req.leader_id,
+                message: bail_response,
+            });
+            return actions;
+        }
+
+        // log staleness check
+        // if we have an entry at last_included_index with a term that matches last_included_term,
+        // then we match the snapshot and don't need to do anything; otherwise (if we have an entry
+        // that isn't at that term or we don't have an entry, we clear the entire log and load up the snapshot)
+        if let Some(term) = self.log_term_at(req.last_included_index) {
+            // we have an entry at last_included_index, if term matches, we can just respond
+            // successfully (maybe we didn't have a snapshot at the exact spot but we did track the
+            // entry)
+            if term == req.last_included_term {
+                // send req.last_included_index to
+                // communicate to the leader that we have this index already
+                actions.push(Action::SendMessage {
+                    target: req.leader_id,
+                    message: Message::InstallSnapshotResponse(InstallSnapshotResponseRPC {
+                        id: self.id,
+                        term: self.current_term,
+                        last_included_index: req.last_included_index,
+                    }),
+                });
+                return actions;
+            }
+        }
+
+        // otherwise, we actually clear the log and install this snapshot
+        actions.push(Action::InstallSnapshot {
+            last_included_index: req.last_included_index,
+            last_included_term: req.last_included_term,
+            data: req.data,
+        });
+        self.log.clear();
+        self.last_included_index = req.last_included_index;
+        self.last_included_term = req.last_included_term;
+        self.last_applied = req.last_included_index;
+        self.commit_index = req.last_included_index;
+        actions.push(Action::SendMessage {
+            target: req.leader_id,
+            message: Message::InstallSnapshotResponse(InstallSnapshotResponseRPC {
+                id: self.id,
+                term: self.current_term,
+                last_included_index: self.last_included_index,
+            }),
+        });
+        actions
+    }
+
+    /// For a leader to handle a response to an InstallSnapshotRPC
+    pub fn handle_install_snapshot_response(
+        &mut self,
+        resp: InstallSnapshotResponseRPC,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if let Some(persist_actions) = self.check_msg_term(resp.term) {
+            actions.extend(persist_actions);
+        }
+
+        if self.state != RaftState::Leader {
+            // we aren't the leader so we shouldn't be handling this response
+            return actions;
+        }
+
+        // update next and match index for the follower
+        self.next_index
+            .insert(resp.id, resp.last_included_index + 1);
+        self.match_index.insert(resp.id, resp.last_included_index);
+
+        actions
+    }
 }
 
 #[cfg(test)]
@@ -831,6 +975,12 @@ mod tests {
                     Message::AppendEntriesResponse(resp) => self
                         .node_mut(recipient)
                         .handle_append_entries_response(resp),
+                    Message::InstallSnapshot(req) => {
+                        self.node_mut(recipient).handle_install_snapshot(req)
+                    }
+                    Message::InstallSnapshotResponse(resp) => self
+                        .node_mut(recipient)
+                        .handle_install_snapshot_response(resp),
                 };
                 let mut new_actions = self.collect_actions(recipient, actions);
                 results
@@ -874,6 +1024,12 @@ mod tests {
                     Message::AppendEntriesResponse(resp) => self
                         .node_mut(recipient)
                         .handle_append_entries_response(resp),
+                    Message::InstallSnapshot(req) => {
+                        self.node_mut(recipient).handle_install_snapshot(req)
+                    }
+                    Message::InstallSnapshotResponse(resp) => self
+                        .node_mut(recipient)
+                        .handle_install_snapshot_response(resp),
                 };
                 results.entry(target).or_default().extend(
                     self.collect_actions(recipient, actions)
@@ -2976,4 +3132,307 @@ mod tests {
     }
 
     // --- Logical index tests end
+
+    #[test]
+    fn prepare_snapshot_test() {
+        let node = fresh_node();
+        let snapshot = node.prepare_snapshot();
+        assert_eq!(snapshot.last_applied, 0);
+        assert_eq!(snapshot.last_applied_term, 0);
+
+        let mut node = node_with_no_snapshot();
+        node.last_applied = 1;
+        let snapshot = node.prepare_snapshot();
+        assert_eq!(snapshot.last_applied, 1);
+        assert_eq!(snapshot.last_applied_term, 1);
+
+        let mut node = node_with_no_snapshot();
+        node.last_applied = 3;
+        let snapshot = node.prepare_snapshot();
+        assert_eq!(snapshot.last_applied, 3);
+        assert_eq!(snapshot.last_applied_term, 2);
+
+        let mut node = node_with_snapshot_and_additional();
+        node.last_applied = 101;
+        let snapshot = node.prepare_snapshot();
+        assert_eq!(snapshot.last_applied, 101);
+        assert_eq!(snapshot.last_applied_term, 2);
+
+        let mut node = node_with_snapshot_and_additional();
+        node.last_applied = 102;
+        let snapshot = node.prepare_snapshot();
+        assert_eq!(snapshot.last_applied, 102);
+        assert_eq!(snapshot.last_applied_term, 3);
+    }
+
+    #[test]
+    fn complete_snapshot_test() {
+        let mut node = node_with_no_snapshot();
+        node.complete_snapshot(SnapshotMetadata {
+            last_applied: 2,
+            last_applied_term: 1,
+        });
+        assert_eq!(node.last_included_index, 2);
+        assert_eq!(node.last_included_term, 1);
+        assert_eq!(node.log.len(), 1);
+        assert_eq!(node.log[0].term, 2);
+
+        let mut node = node_with_snapshot_and_additional();
+        node.complete_snapshot(SnapshotMetadata {
+            last_applied: 101,
+            last_applied_term: 2,
+        });
+        assert_eq!(node.last_included_index, 101);
+        assert_eq!(node.last_included_term, 2);
+        assert_eq!(node.log.len(), 1);
+    }
+
+    #[test]
+    fn complete_snapshot_bail() {
+        let mut node = node_with_snapshot_and_additional();
+        // since last_applied is less than last_included_index (maybe another snapshot came in),
+        // this shouldn't change the state of the node
+        node.complete_snapshot(SnapshotMetadata {
+            last_applied: 50,
+            last_applied_term: 1,
+        });
+        assert_eq!(node.last_included_index, 100);
+        assert_eq!(node.last_included_term, 2);
+    }
+
+    #[test]
+    fn node_sends_snapshot() {
+        let mut leader = node_with_snapshot_and_additional();
+        leader.current_term = 3;
+        // set next_index for 2 to be 3 to be in snapshot range
+        leader.next_index.insert(2, 3);
+        // attempt to build append entries for node 2 and ensure InstallSnapshot is sent
+        let action = leader.build_append_entries_for_peer(2);
+        match action {
+            Action::SendInstallSnapshot {
+                target,
+                term,
+                last_included_index,
+                last_included_term,
+            } => {
+                assert_eq!(target, 2);
+                assert_eq!(term, 3);
+                assert_eq!(last_included_index, 100);
+                assert_eq!(last_included_term, 2);
+            }
+            _ => panic!("Expected SendInstallSnapshot!"),
+        }
+
+        // adjust next_index for follower to be at last_included_index + 1 and ensure we get normal
+        // append entries
+        leader.next_index.insert(2, leader.last_included_index + 1);
+        let action = leader.build_append_entries_for_peer(2);
+        if let Action::SendMessage { target, message } = action {
+            if let Message::AppendEntries(req) = message {
+                assert_eq!(target, 2);
+                assert_eq!(req.entries.len(), 2);
+            } else {
+                panic!("Should have received AppendEntries");
+            }
+        } else {
+            panic!("Should have a SendMessage Action");
+        }
+
+        // finally test that a node with nothing in its log (just restarted with no persistent
+        // state) gets a snapshot
+        leader.next_index.insert(2, 0);
+        let action = leader.build_append_entries_for_peer(2);
+        match action {
+            Action::SendInstallSnapshot {
+                target,
+                term,
+                last_included_index,
+                last_included_term,
+            } => {
+                assert_eq!(target, 2);
+                assert_eq!(term, 3);
+                assert_eq!(last_included_index, 100);
+                assert_eq!(last_included_term, 2);
+            }
+            _ => panic!("Expected SendInstallSnapshot!"),
+        }
+    }
+
+    #[test]
+    fn test_install_snapshot_response() {
+        let mut node = node_with_snapshot_and_additional();
+        node.state = RaftState::Leader;
+        node.current_term = 3;
+        node.next_index.entry(2).or_insert(0);
+        node.match_index.entry(2).or_insert(0);
+
+        // happy path
+        let actions = node.handle_install_snapshot_response(InstallSnapshotResponseRPC {
+            id: 2,
+            term: 3,
+            last_included_index: 100,
+        });
+        assert!(actions.is_empty());
+        assert_eq!(
+            *node.next_index.get(&2).unwrap(),
+            node.last_included_index + 1
+        );
+        assert_eq!(*node.match_index.get(&2).unwrap(), node.last_included_index);
+
+        let actions = node.handle_install_snapshot_response(InstallSnapshotResponseRPC {
+            id: 2,
+            term: 4,
+            last_included_index: 105,
+        });
+        assert!(!actions.is_empty());
+        if let Action::PersistMetadata { term, voted_for } = actions[0] {
+            assert_eq!(term, 4);
+            assert_eq!(voted_for, None);
+        } else {
+            panic!("Should have received a PersistMetadata Action");
+        }
+    }
+
+    #[test]
+    fn test_handle_snapshot_bail() {
+        let mut node = node_with_snapshot_and_additional();
+        node.current_term = 2;
+        let actions = node.handle_install_snapshot(InstallSnapshotRPC {
+            term: node.current_term - 1,
+            leader_id: 2,
+            last_included_index: 100,
+            last_included_term: 1,
+            data: vec![],
+        });
+        assert_eq!(actions.len(), 1);
+        if let Action::SendMessage {
+            target: 2,
+            message: Message::InstallSnapshotResponse(resp),
+        } = &actions[0]
+        {
+            assert_eq!(resp.last_included_index, 100);
+        } else {
+            panic!("Should have a InstallSnapshotResponse RPC Message to send");
+        }
+
+        let actions = node.handle_install_snapshot(InstallSnapshotRPC {
+            term: 2,
+            leader_id: 2,
+            last_included_index: node.last_included_index / 2,
+            last_included_term: 1,
+            data: vec![],
+        });
+        assert_eq!(actions.len(), 1);
+        if let Action::SendMessage {
+            target: 2,
+            message: Message::InstallSnapshotResponse(resp),
+        } = &actions[0]
+        {
+            assert_eq!(resp.last_included_index, 100);
+        } else {
+            panic!("Should have a InstallSnapshotResponse RPC Message to send");
+        }
+    }
+
+    #[test]
+    fn test_snapshot_retention() {
+        let mut node = node_with_snapshot_and_additional();
+        node.current_term = 3;
+        // this test will have a snapshot sent where the node already has that index and term
+        // (matches the entry at index 101 with term 2)
+        let actions = node.handle_install_snapshot(InstallSnapshotRPC {
+            term: 3,
+            leader_id: 2,
+            last_included_index: 101,
+            last_included_term: 2,
+            data: vec![],
+        });
+        assert_eq!(actions.len(), 1);
+        if let Action::SendMessage {
+            target: 2,
+            message: Message::InstallSnapshotResponse(resp),
+        } = &actions[0]
+        {
+            assert_eq!(resp.last_included_index, 101);
+        } else {
+            panic!("Should have a InstallSnapshotResponse RPC message to send");
+        }
+        // node shouldn't update its last included index of its own snapshot
+        assert_eq!(node.last_included_index, 100);
+        assert_eq!(node.log.len(), 2);
+        // no changes to log
+        assert_eq!(node.log_term_at(101).unwrap(), 2);
+        assert_eq!(node.log_term_at(102).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_snapshot_install() {
+        // node is off on its own making entries (maybe it saved this off and restored)
+        let mut node = node_with_no_snapshot();
+        node.current_term = 2;
+        node.commit_index = 3;
+        node.last_included_index = 3;
+
+        let actions = node.handle_install_snapshot(InstallSnapshotRPC {
+            term: 3,
+            leader_id: 2,
+            last_included_index: 50,
+            last_included_term: 3,
+            data: vec![1, 2, 3],
+        });
+        assert_eq!(actions.len(), 3);
+        // need to ensure that the install snapshot Action is BEFORE the SendMessage back to the
+        // leader. the first action will be PersistMetadata because of the change of term
+        if let Action::PersistMetadata { term, voted_for } = &actions[0] {
+            assert_eq!(*term, 3);
+            assert_eq!(*voted_for, None);
+        } else {
+            panic!("Should have a PersistMetadata Action");
+        }
+
+        if let Action::InstallSnapshot {
+            last_included_index,
+            last_included_term,
+            data,
+        } = &actions[1]
+        {
+            assert_eq!(*last_included_index, 50);
+            assert_eq!(*last_included_term, 3);
+            assert_eq!(data, &vec![1, 2, 3]);
+        } else {
+            panic!("Should have a InstallSnapshot Action");
+        }
+
+        if let Action::SendMessage {
+            target: 2,
+            message: Message::InstallSnapshotResponse(resp),
+        } = &actions[2]
+        {
+            assert_eq!(resp.last_included_index, 50);
+        } else {
+            panic!("Should have a InstallSnapshotResponse RPC message");
+        }
+
+        // check the node's state
+        assert!(node.log.is_empty());
+        assert_eq!(node.last_included_index, 50);
+        assert_eq!(node.last_included_term, 3);
+        assert_eq!(node.last_applied, 50);
+        assert_eq!(node.commit_index, 50);
+    }
+
+    #[test]
+    fn test_candidate_step_down() {
+        let mut node = node_with_no_snapshot();
+        node.state = RaftState::Candidate;
+        node.current_term = 2;
+        let _ = node.handle_install_snapshot(InstallSnapshotRPC {
+            term: 2,
+            leader_id: 2,
+            last_included_index: 100,
+            last_included_term: 50,
+            data: vec![],
+        });
+        assert_eq!(node.state, RaftState::Follower);
+    }
 }
