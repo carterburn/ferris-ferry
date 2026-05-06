@@ -50,6 +50,38 @@ pub enum Message {
     InstallSnapshotResponse(InstallSnapshotResponseRPC),
 }
 
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Message::*;
+        match self {
+            RequestVote(req) => write!(
+                f,
+                "RequestVote(candidate={}, term={})",
+                req.candidate_id, req.term
+            ),
+            RequestVoteResponse(resp) => write!(
+                f,
+                "RequestVoteResponse(id={},term={},vote={})",
+                resp.id, resp.term, resp.vote_granted
+            ),
+            AppendEntries(req) => write!(
+                f,
+                "AppendEntries(leader={},term={},num_entries={})",
+                req.leader_id,
+                req.term,
+                req.entries.len()
+            ),
+            AppendEntriesResponse(resp) => write!(
+                f,
+                "AppendEntriesResponse(id={},success={})",
+                resp.id, resp.success
+            ),
+            InstallSnapshot(req) => write!(f, "InstallSnapshot(leader_id={})", req.leader_id),
+            InstallSnapshotResponse(resp) => write!(f, "InstallSnapshotResponse(id={})", resp.id),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestVoteRPC {
     pub term: u64,

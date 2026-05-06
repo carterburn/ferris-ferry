@@ -10,8 +10,9 @@ use tokio::{
     sync::{self, oneshot},
     time::Interval,
 };
+use tracing::{debug, info, warn};
 
-use crate::types::{AppliedEntry, Proposal, ProposalError};
+use crate::types::{AppliedEntry, Proposal, ProposalError, Snapshot};
 
 pub mod types;
 
@@ -86,6 +87,12 @@ struct RaftDriver<T: Transport, S: Storage> {
 
     /// Pending proposals for commands
     pending_proposals: HashMap<u64, oneshot::Sender<Result<(), ProposalError>>>,
+
+    /// Entries since last snapshot
+    num_entries: usize,
+
+    /// Number of entries to apply before snapshotting
+    snapshot_threshold: usize,
 
     /// Transport for sending messages
     transport: T,
@@ -169,6 +176,8 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
             applied: applied_sender,
             interval,
             pending_proposals: HashMap::new(),
+            num_entries: 0,
+            snapshot_threshold: config.snapshot_threshold,
             core,
             transport,
             storage,
@@ -179,6 +188,7 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
         // the MAIN EVENT (loop)
         // here, we run an infinite loop either receiving proposals from the application on the
         // proposal channel or messages from the network
+        tracing::info!(node_id = self.id, "Starting event loop");
 
         loop {
             tokio::select! {
@@ -189,6 +199,7 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                     }
                 }
                 Some(proposal) = self.proposal.recv() => {
+                    tracing::debug!(node_id = self.id, "proposal received from application");
                     // propose new command and wait for the response to come through
                     if let Some(actions) = self.core.propose(proposal.command) {
                         // grab the PersistLogEntries for the index
@@ -203,17 +214,19 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                         }
                     } else {
                         if proposal.respond.send(Err(ProposalError::FollowerNode)).is_err() {
-                            println!("Error sending proposal response")
+                            tracing::warn!("Error sending proposal response")
                         }
                     }
                 },
                 msg = self.transport.recv() => {
+                    tracing::debug!(node_id = self.id, msg = %msg, "received Message");
                     let before = self.core.is_leader();
                     self.handle_message(msg).await;
                     let after = self.core.is_leader();
                     if before && !after {
                         // we were the leader and now we're not, we have to get rid of the pending
                         // proposals and notify them of failure
+                        tracing::info!(node_id = self.id, "leadership change detected, draining pending proposals");
                         for (_, channel) in self.pending_proposals.drain() {
                             let _ = channel.send(Err(ProposalError::LostLeadership));
                         }
@@ -302,10 +315,47 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                 if let Some(channel) = self.pending_proposals.remove(&index) {
                     let _ = channel.send(Ok(()));
                 }
+                // if the command is empty, we don't send to the application
+                if command.is_empty() {
+                    return;
+                }
                 self.applied
                     .send(AppliedEntry::Command(command))
                     .await
                     .expect("Unable to send applied commands; cannot continue");
+                self.num_entries += 1;
+                if self.num_entries >= self.snapshot_threshold {
+                    tracing::info!(
+                        node_id = self.id,
+                        "reached snapshot threshold and snapshotting"
+                    );
+                    // time to snapshot so we will also request the snapshot data
+                    let (tx, rx) = oneshot::channel();
+                    self.applied
+                        .send(AppliedEntry::SnapshotRequest(tx))
+                        .await
+                        .expect("Unable to send snapshot request; cannot continue");
+                    // SAFETY: once we await the receiver, no other entries could be applied in the
+                    // event loop's task, so we know that once the bytes are retrieved and we
+                    // synchronously call prepare_snapshot() we know the indices and bytes match up
+                    let data = rx
+                        .await
+                        .expect("Unable to receive application data for snapshot; cannot continue");
+                    let metadata = self.core.prepare_snapshot();
+                    // the data can be stored in a separate task, it no longer matters because we
+                    // have the data and indices matched
+                    self.storage
+                        .store_snapshot(Snapshot {
+                            last_included_index: metadata.last_applied,
+                            last_included_term: metadata.last_applied_term,
+                            data,
+                        })
+                        .await
+                        .expect("Unable to store snapshot");
+                    // signal to the core that we have stored the snapshot
+                    self.core.complete_snapshot(metadata);
+                    self.num_entries = 0;
+                }
             }
         }
     }

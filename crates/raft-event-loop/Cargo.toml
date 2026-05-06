@@ -7,3 +7,7 @@ edition = "2024"
 raftcore = { path = "../raftcore"}
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.1", features = ["time", "sync", "rt", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+raft-test-utils = {path = "../raft-test-utils"}

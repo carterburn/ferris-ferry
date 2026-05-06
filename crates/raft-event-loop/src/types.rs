@@ -1,6 +1,7 @@
 use std::{fmt::Display, ops::Range, time::Duration};
 
 use raftcore::types::{LogEntry, Message, NodeId};
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub struct RaftConfig<T: Transport, S: Storage> {
@@ -9,6 +10,7 @@ pub struct RaftConfig<T: Transport, S: Storage> {
     pub heartbeat_interval: Option<u64>,
     pub election_range: Range<u64>,
     pub tick_length: Duration,
+    pub snapshot_threshold: usize,
     pub transport: T,
     pub storage: S,
 }
@@ -40,7 +42,7 @@ pub trait Storage {
 
     fn store_log_entries(
         &self,
-        metadata: PersistedLogAddendum,
+        addendum: PersistedLogAddendum,
     ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
 
     fn restore_log_entries(
@@ -63,16 +65,19 @@ pub trait Storage {
     ) -> impl std::future::Future<Output = std::io::Result<Option<Snapshot>>> + Send;
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PersistedMetadata {
     pub term: u64,
     pub voted_for: Option<NodeId>,
 }
 
+#[derive(Clone)]
 pub struct PersistedLogAddendum {
     pub start_index: u64,
     pub entries: Vec<LogEntry>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
@@ -108,4 +113,5 @@ impl Display for ProposalError {
 pub enum AppliedEntry {
     Command(Vec<u8>),
     Snapshot(Vec<u8>),
+    SnapshotRequest(oneshot::Sender<Vec<u8>>),
 }

@@ -11,6 +11,7 @@ use crate::types::{
 };
 
 use rand::prelude::*;
+use tracing::{debug, error, info, trace, warn};
 
 pub mod types;
 
@@ -110,6 +111,8 @@ impl RaftCore {
 
         let election_timeout = rng.random_range(election_range.clone());
 
+        tracing::info!(id, "initializing Raft from empty state");
+
         Self {
             id,
             peers,
@@ -157,6 +160,7 @@ impl RaftCore {
         log: Vec<LogEntry>,
     ) -> Self {
         let mut node = Self::new(id, nodes, heartbeat_interval, election_range);
+        tracing::info!(node.id, "restoring from persistent state");
         node.current_term = current_term;
         node.voted_for = voted_for;
         node.log = log;
@@ -200,8 +204,11 @@ impl RaftCore {
             voted_for,
             log,
         );
+        tracing::info!(id, "restoring from snapshot");
         node.last_included_index = last_included_index;
         node.last_included_term = last_included_term;
+        node.commit_index = last_included_index;
+        node.last_applied = last_included_index;
         node
     }
 
@@ -270,6 +277,7 @@ impl RaftCore {
             return None;
         }
 
+        tracing::debug!(node_id = self.id, "proposal accepted for node");
         self.log.push(LogEntry {
             term: self.current_term,
             command,
@@ -369,6 +377,10 @@ impl RaftCore {
     fn election_timeout(&mut self) -> Vec<Action> {
         // have we hit an election timeout?
         if self.ticks_since_last_heartbeat >= self.election_timeout {
+            tracing::info!(
+                node_id = self.id,
+                "election timeout reached; beginning election"
+            );
             // start an election
             self.current_term += 1;
             self.state = RaftState::Candidate;
@@ -376,6 +388,7 @@ impl RaftCore {
             // reset votes and vote for ourself
             self.votes_received.clear();
             self.voted_for = Some(self.id);
+            tracing::debug!(node_id = self.id, "granting vote for self");
             self.votes_received.insert(self.id);
             self.reset_election_timeout();
 
@@ -412,6 +425,10 @@ impl RaftCore {
     /// message we received
     fn check_msg_term(&mut self, msg_term: u64) -> Option<Vec<Action>> {
         if msg_term > self.current_term {
+            tracing::info!(
+                self.id,
+                "received message with higher term, transition to Follower"
+            );
             self.current_term = msg_term;
             self.state = RaftState::Follower;
             self.voted_for = None;
@@ -439,6 +456,7 @@ impl RaftCore {
 
         if req.term < self.current_term {
             // the requestor is on an earlier term, so we return false and don't vote for it!
+            tracing::debug!(node_id = self.id, "rejecting vote for {}", req.candidate_id);
             actions.push(Action::SendMessage {
                 target: req.candidate_id,
                 message: false_response,
@@ -460,6 +478,7 @@ impl RaftCore {
         let grant_vote = can_vote && log_check;
 
         if grant_vote {
+            tracing::debug!(node_id = self.id, "granting vote for {}", req.candidate_id);
             self.reset_election_timeout();
             self.voted_for = Some(req.candidate_id);
             actions.extend([
@@ -477,6 +496,7 @@ impl RaftCore {
                 },
             ]);
         } else {
+            tracing::debug!(node_id = self.id, "rejecting vote for {}", req.candidate_id);
             actions.push(Action::SendMessage {
                 target: req.candidate_id,
                 message: false_response,
@@ -501,6 +521,7 @@ impl RaftCore {
 
             if self.votes_received.len() as u64 > ((self.peers.len() as u64 + 1) / 2) {
                 // we won the election, transition to leader state
+                tracing::info!(node_id = self.id, "won election, transition to Leader");
                 self.state = RaftState::Leader;
                 actions.push(self.initialize_leader_state());
                 self.reset_election_timeout();
@@ -544,18 +565,29 @@ impl RaftCore {
             // convert to follower and mark we didn't vote in the term (somehow, majority of
             // servers voted this server sending req to leader, so we follow suit and become a
             // follower)
+            tracing::info!(node_id = self.id, "transition to Follower");
             self.state = RaftState::Follower;
         }
 
         // ensure we are a follower
         if self.state != RaftState::Follower {
             // send nothing if we are a leader or candidate
+            tracing::debug!(
+                node_id = self.id,
+                "rejecting append entries for {}",
+                req.leader_id
+            );
             actions.push(make_response(response));
             return actions;
         }
 
         if req.term < self.current_term {
             // "Leader" is on an earlier term, so we send back a false response
+            tracing::warn!(
+                self.id,
+                "rejecting append entries (stale term) for {}",
+                req.leader_id
+            );
             actions.push(make_response(response));
             return actions;
         }
@@ -575,6 +607,11 @@ impl RaftCore {
             actions.push(if req.prev_log_index > self.last_log_index() {
                 // this node's log is too short, so there isn't a conflicting term, we just need a
                 // lot to catch up
+                tracing::debug!(
+                    node_id = self.id,
+                    "rejecting append entries for {}",
+                    req.leader_id
+                );
                 response.first_conflicting_index = Some(self.last_log_index() + 1);
                 make_response(response)
             } else {
@@ -592,6 +629,11 @@ impl RaftCore {
                 }
                 response.first_conflicting_index = conflicting_index;
                 response.first_conflicting_term = Some(conflicting_term);
+                tracing::debug!(
+                    node_id = self.id,
+                    "rejecting append entries for {}",
+                    req.leader_id
+                );
                 make_response(response)
             });
             return actions;
@@ -627,6 +669,12 @@ impl RaftCore {
             // self.log with the new entry
             self.log.push(new_entry);
         }
+        tracing::debug!(
+            self.id,
+            "accepted {} entries from {}",
+            req.entries.len(),
+            req.leader_id
+        );
 
         // if log has changed (had entries) persist the entries starting from req.prev_log_index + 1
         if !req.entries.is_empty() {
@@ -643,6 +691,13 @@ impl RaftCore {
             self.commit_index = min(req.leader_commit, self.last_log_index());
             // we should apply all of the entries between old_commit and the new commit_index
             let apply_entries = self.log_slice(old_commit + 1, self.commit_index + 1);
+            tracing::info!(
+                self.id,
+                "updated commit index from {} to {} (apply {} entries)",
+                old_commit,
+                self.commit_index,
+                apply_entries.len()
+            );
             actions.extend(
                 apply_entries
                     .iter()
@@ -656,6 +711,11 @@ impl RaftCore {
             self.last_applied = self.commit_index;
         }
 
+        tracing::info!(
+            node_id = self.id,
+            "append entries accepted for {}",
+            req.leader_id
+        );
         actions.push(Action::SendMessage {
             target: req.leader_id,
             message: Message::AppendEntriesResponse(AppendEntriesResponseRPC {
@@ -717,8 +777,18 @@ impl RaftCore {
         }
 
         // update commit index and apply all entries from last_applied to commit index
+
         self.commit_index = new_commit;
         let entries = self.log_slice(self.last_applied + 1, self.commit_index + 1);
+        if prev_commit_index != new_commit {
+            tracing::info!(
+                self.id,
+                "update commit index from {} to {} (apply {} entries)",
+                prev_commit_index,
+                new_commit,
+                entries.len()
+            );
+        }
         for (index, entry) in entries.iter().enumerate() {
             actions.push(Action::ApplyToStateMachine {
                 index: index as u64 + self.last_applied + 1,
@@ -753,6 +823,7 @@ impl RaftCore {
     /// Returns the information needed for a snapshot to be recorded. The caller should provide
     /// this information back in complete_snapshot.
     pub fn prepare_snapshot(&self) -> SnapshotMetadata {
+        tracing::debug!(node_id = self.id, "preparing a snapshot");
         // SAFETY: we know that there is a log term at the last applied index
         SnapshotMetadata {
             last_applied: self.last_applied,
@@ -775,6 +846,7 @@ impl RaftCore {
         // reset last_included_index
         self.last_included_index = metadata.last_applied;
         self.last_included_term = metadata.last_applied_term;
+        tracing::info!(node_id = self.id, "snapshot accepted");
     }
 
     /// For a follower to handle a InstallSnapshotRPC
@@ -791,6 +863,11 @@ impl RaftCore {
         });
 
         if req.term < self.current_term {
+            tracing::debug!(
+                node_id = self.id,
+                "rejecting install snapshot from {}",
+                req.leader_id
+            );
             actions.push(Action::SendMessage {
                 target: req.leader_id,
                 message: bail_response,
@@ -800,6 +877,7 @@ impl RaftCore {
 
         if req.term == self.current_term && self.state == RaftState::Candidate {
             // step down to be a follower...
+            tracing::info!(node_id = self.id, "transition to Follower");
             self.state = RaftState::Follower;
         }
 
@@ -807,6 +885,11 @@ impl RaftCore {
 
         if req.last_included_index <= self.last_included_index {
             // stale snapshot, just return
+            tracing::debug!(
+                node_id = self.id,
+                "rejecting install snapshot from {}",
+                req.leader_id
+            );
             actions.push(Action::SendMessage {
                 target: req.leader_id,
                 message: bail_response,
@@ -838,6 +921,11 @@ impl RaftCore {
         }
 
         // otherwise, we actually clear the log and install this snapshot
+        tracing::info!(
+            node_id = self.id,
+            "accepting install snapshot for {}",
+            req.leader_id
+        );
         actions.push(Action::InstallSnapshot {
             last_included_index: req.last_included_index,
             last_included_term: req.last_included_term,
