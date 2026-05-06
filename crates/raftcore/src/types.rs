@@ -16,6 +16,7 @@ pub enum Action {
         message: Message,
     },
     ApplyToStateMachine {
+        index: u64,
         command: Vec<u8>,
     },
     PersistMetadata {

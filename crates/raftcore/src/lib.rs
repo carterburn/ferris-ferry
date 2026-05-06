@@ -12,7 +12,7 @@ use crate::types::{
 
 use rand::prelude::*;
 
-mod types;
+pub mod types;
 
 /// A sans-i/o implementation of the Raft Consensus Algorithm.
 ///
@@ -49,7 +49,7 @@ mod types;
 ///   at that index. For example, there may be a start index of 10 and 3 entries, that means the new
 ///   entries to persist are at index 10, 11, and 12. This may mean entries in the log are
 ///   overwritten, but that is how the Action will communicate with the event loop.
-struct RaftCore {
+pub struct RaftCore {
     id: NodeId,
     peers: Vec<NodeId>,
     state: RaftState,
@@ -161,6 +161,53 @@ impl RaftCore {
         node.voted_for = voted_for;
         node.log = log;
         node
+    }
+
+    /// Restore this RaftNode from a snapshot and persisted state. This will restore if a node has
+    /// crashed and has a snapshot saved. The snapshot is applied first then the persisted metadata
+    /// to ensure that a node starts up as close to the ground truth as possible.
+    ///
+    /// Arguments:
+    /// - id: This node's ID.
+    /// - nodes: A collection of all the NodeId's in the cluster (including THIS node's ID).
+    /// - heartbeat_interval: Optional setting of the number of ticks to heartbeat
+    /// - election_range: Acceptable range for election timeout. Concrete value chosen with each
+    ///   term. Provide the range as ticks based on chosen tick interval (i.e. if ticks are every
+    ///   10ms, and you want a 150-300ms election timeout as noted by the paper, this should be
+    ///   15..31).
+    /// - current_term: The restored term the node was on.
+    /// - voted_for: The restored vote for the current term.
+    /// - log: The restored log.
+    /// - last_included_index: Last index included in the snapshot.
+    /// - last_included_term: Term of the entry at the last_included_index.
+    pub fn restore_with_snapshot(
+        id: NodeId,
+        nodes: &[NodeId],
+        heartbeat_interval: Option<u64>,
+        election_range: Range<u64>,
+        current_term: u64,
+        voted_for: Option<NodeId>,
+        log: Vec<LogEntry>,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> Self {
+        let mut node = Self::restore(
+            id,
+            nodes,
+            heartbeat_interval,
+            election_range,
+            current_term,
+            voted_for,
+            log,
+        );
+        node.last_included_index = last_included_index;
+        node.last_included_term = last_included_term;
+        node
+    }
+
+    /// Returns if the node is currently the leader
+    pub fn is_leader(&self) -> bool {
+        self.state == RaftState::Leader
     }
 
     /// Returns the logical index of the last entry including snapshots.
@@ -599,11 +646,14 @@ impl RaftCore {
             actions.extend(
                 apply_entries
                     .iter()
-                    .map(|entry| Action::ApplyToStateMachine {
+                    .enumerate()
+                    .map(|(index, entry)| Action::ApplyToStateMachine {
+                        index: index as u64 + old_commit + 1,
                         command: entry.command.clone(),
                     })
                     .collect::<Vec<_>>(),
-            )
+            );
+            self.last_applied = self.commit_index;
         }
 
         actions.push(Action::SendMessage {
@@ -669,8 +719,9 @@ impl RaftCore {
         // update commit index and apply all entries from last_applied to commit index
         self.commit_index = new_commit;
         let entries = self.log_slice(self.last_applied + 1, self.commit_index + 1);
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
             actions.push(Action::ApplyToStateMachine {
+                index: index as u64 + self.last_applied + 1,
                 command: entry.command.clone(),
             });
         }
@@ -1928,7 +1979,10 @@ mod tests {
         assert_eq!(leader_actions.len(), 1);
         assert!(matches!(
             leader_actions[0],
-            Action::ApplyToStateMachine { command: _ }
+            Action::ApplyToStateMachine {
+                command: _,
+                index: _
+            }
         ));
     }
 
@@ -1950,14 +2004,20 @@ mod tests {
         assert_eq!(node_actions.len(), 1);
         assert!(matches!(
             node_actions[0],
-            Action::ApplyToStateMachine { command: _ }
+            Action::ApplyToStateMachine {
+                command: _,
+                index: _
+            }
         ));
         assert_eq!(cluster.node(3).commit_index, 2);
         let node_actions = actions.get(&3).unwrap();
         assert_eq!(node_actions.len(), 1);
         assert!(matches!(
             node_actions[0],
-            Action::ApplyToStateMachine { command: _ }
+            Action::ApplyToStateMachine {
+                command: _,
+                index: _
+            }
         ));
     }
 
@@ -1979,7 +2039,10 @@ mod tests {
         assert_eq!(leader_actions.len(), 1);
         assert!(matches!(
             leader_actions[0],
-            Action::ApplyToStateMachine { command: _ }
+            Action::ApplyToStateMachine {
+                command: _,
+                index: _
+            }
         ));
         assert_eq!(
             cluster
@@ -2006,7 +2069,10 @@ mod tests {
         assert_eq!(leader_actions.len(), 1);
         assert!(matches!(
             leader_actions[0],
-            Action::ApplyToStateMachine { command: _ }
+            Action::ApplyToStateMachine {
+                command: _,
+                index: _
+            }
         ));
         // leader should be at 2 for commit_index
         assert_eq!(
@@ -2074,11 +2140,11 @@ mod tests {
             let mut cmd2 = false;
             assert_eq!(actions.len(), 2);
             for a in actions {
-                if let Action::ApplyToStateMachine { command } = a {
+                if let Action::ApplyToStateMachine { command, index } = a {
                     if *command.last().unwrap() == b'D' {
-                        cmd1 = true;
+                        cmd1 = index == 2;
                     } else if *command.last().unwrap() == b'2' {
-                        cmd2 = true;
+                        cmd2 = index == 3;
                     }
                 }
             }
@@ -2207,7 +2273,7 @@ mod tests {
         //  ----- ----- -----
 
         // have node1 and 3 progress with node2 falling behind and having different entries
-        let mut entry = LogEntry {
+        let entry = LogEntry {
             term: 1,
             command: DUMMY.to_vec(),
         };
