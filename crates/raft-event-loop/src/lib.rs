@@ -10,7 +10,6 @@ use tokio::{
     sync::{self, oneshot},
     time::Interval,
 };
-use tracing::{debug, info, warn};
 
 use crate::types::{AppliedEntry, Proposal, ProposalError, Snapshot};
 

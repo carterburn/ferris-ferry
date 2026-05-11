@@ -65,7 +65,7 @@ pub trait Storage {
     ) -> impl std::future::Future<Output = std::io::Result<Option<Snapshot>>> + Send;
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedMetadata {
     pub term: u64,
     pub voted_for: Option<NodeId>,
@@ -77,7 +77,7 @@ pub struct PersistedLogAddendum {
     pub entries: Vec<LogEntry>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,

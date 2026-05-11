@@ -11,7 +11,6 @@ use crate::types::{
 };
 
 use rand::prelude::*;
-use tracing::{debug, error, info, trace, warn};
 
 pub mod types;
 
