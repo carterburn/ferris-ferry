@@ -710,7 +710,8 @@ impl RaftCore {
             self.last_applied = self.commit_index;
         }
 
-        tracing::info!(
+        // changing to debug because it spams the log
+        tracing::debug!(
             node_id = self.id,
             "append entries accepted for {}",
             req.leader_id
