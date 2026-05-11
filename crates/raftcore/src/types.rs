@@ -40,7 +40,7 @@ pub enum Action {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Message {
     RequestVote(RequestVoteRPC),
     RequestVoteResponse(RequestVoteResponseRPC),
@@ -82,7 +82,7 @@ impl std::fmt::Display for Message {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RequestVoteRPC {
     pub term: u64,
     pub candidate_id: u64,
@@ -90,7 +90,7 @@ pub struct RequestVoteRPC {
     pub last_log_term: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RequestVoteResponseRPC {
     /// Id of responder
     pub id: u64,
@@ -106,7 +106,7 @@ pub struct LogEntry {
     pub command: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AppendEntriesRPC {
     /// Leader's term
     pub term: u64,
@@ -127,7 +127,7 @@ pub struct AppendEntriesRPC {
     pub leader_commit: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AppendEntriesResponseRPC {
     /// Id of responder
     pub id: u64,
@@ -153,7 +153,7 @@ pub struct SnapshotMetadata {
     pub last_applied_term: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InstallSnapshotRPC {
     pub term: u64,
     pub leader_id: NodeId,
@@ -162,7 +162,7 @@ pub struct InstallSnapshotRPC {
     pub data: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InstallSnapshotResponseRPC {
     pub id: NodeId,
     pub term: u64,

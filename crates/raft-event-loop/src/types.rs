@@ -21,6 +21,19 @@ pub struct RaftNodeDescription<T: Transport> {
     pub address: T::Address,
 }
 
+impl<T> Clone for RaftNodeDescription<T>
+where
+    T::Address: Clone,
+    T: Transport,
+{
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            address: self.address.clone(),
+        }
+    }
+}
+
 pub trait Transport {
     type Address;
 

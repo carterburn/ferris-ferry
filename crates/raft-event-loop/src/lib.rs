@@ -353,6 +353,10 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                         .expect("Unable to store snapshot");
                     // signal to the core that we have stored the snapshot
                     self.core.complete_snapshot(metadata);
+                    self.storage
+                        .truncate_log()
+                        .await
+                        .expect("Unable to clear persistent log; cannot continue");
                     self.num_entries = 0;
                 }
             }
