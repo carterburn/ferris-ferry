@@ -38,6 +38,9 @@ pub enum Action {
         last_included_term: u64,
         data: Vec<u8>,
     },
+    ReadBarrierReady {
+        id: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

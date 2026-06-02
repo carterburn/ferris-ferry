@@ -79,6 +79,10 @@ pub struct RaftCore {
     election_timeout_range: Range<u64>,
     election_timeout: u64,
     heartbeat_interval: u64,
+    // --- Linearizable Read support ---
+    append_entries_count: u64,
+    next_read_barrier_id: u64,
+    read_barriers: HashMap<u64, u64>,
 }
 
 impl RaftCore {
@@ -130,6 +134,9 @@ impl RaftCore {
             election_timeout_range: election_range,
             election_timeout,
             heartbeat_interval: heartbeat_interval.unwrap_or(Self::DEFAULT_HEARTBEAT),
+            append_entries_count: 0,
+            next_read_barrier_id: 0,
+            read_barriers: HashMap::new(),
         }
     }
 
@@ -432,6 +439,8 @@ impl RaftCore {
             self.state = RaftState::Follower;
             self.voted_for = None;
             self.reset_election_timeout();
+            // clear out all pending reads
+            self.read_barriers.drain();
             Some(vec![Action::PersistMetadata {
                 term: self.current_term,
                 voted_for: self.voted_for,
@@ -744,6 +753,8 @@ impl RaftCore {
             // next_index should also be updated to match_index + 1
             let _ = self.match_index.insert(resp.id, resp.match_index);
             let _ = self.next_index.insert(resp.id, resp.match_index + 1);
+            // update append entries count for successes received
+            self.append_entries_count += 1;
         } else {
             // we will update the next index to be the first conflict that the node sent us (if
             // applicable), otherwise we decrement by 1
@@ -797,6 +808,15 @@ impl RaftCore {
         }
         self.last_applied = self.commit_index;
 
+        let majority = (self.peers.len() as u64).div_ceil(2);
+        actions.extend(
+            self.read_barriers
+                .extract_if(|_id, create_count| {
+                    self.append_entries_count >= *create_count + majority
+                })
+                .map(|(id, _)| Action::ReadBarrierReady { id }),
+        );
+
         actions
     }
 
@@ -817,6 +837,18 @@ impl RaftCore {
             start_index: self.last_log_index(),
             entries: entries.to_vec(),
         }
+    }
+
+    /// Allows a client to request a read barrier to produce linearizable reads.
+    pub fn request_read_barrier(&mut self) -> Option<u64> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        self.next_read_barrier_id += 1;
+        self.read_barriers
+            .insert(self.next_read_barrier_id, self.append_entries_count);
+        Some(self.next_read_barrier_id)
     }
 
     /// For an event loop to prepare to save a snapshot
@@ -3020,11 +3052,23 @@ mod tests {
         // ensure that there is a PersistLogEntries Action for node 1
         let leader_actions = actions.get(&1).unwrap();
         match &leader_actions[0] {
-            Action::PersistLogEntries { start_index, entries } => {
+            Action::PersistLogEntries {
+                start_index,
+                entries,
+            } => {
                 assert_eq!(*start_index, 1);
-                assert_eq!(entries, &[LogEntry { term: 1, command: vec![] }].to_vec());
-            },
-            _ => panic!("No PersistLogEntries for leader after winning election and appending the dummy entry")
+                assert_eq!(
+                    entries,
+                    &[LogEntry {
+                        term: 1,
+                        command: vec![]
+                    }]
+                    .to_vec()
+                );
+            }
+            _ => panic!(
+                "No PersistLogEntries for leader after winning election and appending the dummy entry"
+            ),
         }
     }
 

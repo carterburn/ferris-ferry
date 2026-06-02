@@ -1,13 +1,13 @@
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     routing::{delete, get, post},
-    Json, Router,
 };
 use clap::Parser;
 use raft_event_loop::{
-    types::{AppliedEntry, RaftConfig, RaftNodeDescription},
     RaftNode,
+    types::{AppliedEntry, RaftConfig, RaftNodeDescription},
 };
 use raft_file_storage::FileStorage;
 use raft_tcp_transport::TcpTransport;
@@ -126,8 +126,12 @@ async fn get_handler(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Result<Json<GetResponse>, StatusCode> {
-    // NOTE: doing local reads which could be STALE until they work through the Raft protocol. will
-    // update later
+    state.node.read_request().await.map_err(|e| match e {
+        raft_event_loop::types::ProposalError::FollowerNode => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+
+    // cleared to do a read from the local state
     let state = state
         .store
         .read()

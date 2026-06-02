@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use raftcore::{
-    types::{Action, Message, NodeId},
     RaftCore,
+    types::{Action, Message, NodeId},
 };
 use types::{RaftConfig, Storage, Transport};
 
@@ -22,6 +22,9 @@ pub mod types;
 pub struct RaftNode {
     /// Channel to send proposed commands to the Raft log
     proposal: sync::mpsc::Sender<Proposal>,
+
+    /// Channel to send read requests to Raft through
+    read: sync::mpsc::Sender<oneshot::Sender<Result<(), ProposalError>>>,
 }
 
 impl RaftNode {
@@ -33,14 +36,17 @@ impl RaftNode {
         config: RaftConfig<T, S>,
     ) -> (Self, sync::mpsc::Receiver<AppliedEntry>) {
         let (proposal_sender, proposal_receiver) = sync::mpsc::channel(Self::CHANNEL_BUFFER);
+        let (read_sender, read_receiver) = sync::mpsc::channel(Self::CHANNEL_BUFFER);
         let (applied_sender, applied_receiver) = sync::mpsc::channel(Self::CHANNEL_BUFFER);
 
-        let driver = RaftDriver::new(config, proposal_receiver, applied_sender).await;
+        let driver =
+            RaftDriver::new(config, proposal_receiver, read_receiver, applied_sender).await;
         tokio::spawn(async move { driver.event_loop().await });
 
         (
             Self {
                 proposal: proposal_sender,
+                read: read_sender,
             },
             applied_receiver,
         )
@@ -64,6 +70,19 @@ impl RaftNode {
         rx.await
             .expect("Error receiving response of proposal; cannot continue")
     }
+
+    /// Propose a read request in the cluster. The read request effectively just ensures that the
+    /// node's state machine that is being read from is still in fact a leader which gives
+    /// linearizable reads.
+    pub async fn read_request(&self) -> Result<(), ProposalError> {
+        let (tx, rx) = oneshot::channel();
+        self.read
+            .send(tx)
+            .await
+            .expect("Unable to send read requests; cannot continue");
+        rx.await
+            .expect("Error receiving response of read request; cannot continue")
+    }
 }
 
 /// The key event loop type to interact with the RaftCore. This type is not meant to be constructed
@@ -74,6 +93,9 @@ struct RaftDriver<T: Transport, S: Storage> {
 
     /// Channel to receive proposed commands on
     proposal: sync::mpsc::Receiver<Proposal>,
+
+    /// Channel to receive read requests on
+    read: sync::mpsc::Receiver<sync::oneshot::Sender<Result<(), ProposalError>>>,
 
     /// Channel to send applied commands back to the application
     applied: sync::mpsc::Sender<AppliedEntry>,
@@ -86,6 +108,9 @@ struct RaftDriver<T: Transport, S: Storage> {
 
     /// Pending proposals for commands
     pending_proposals: HashMap<u64, oneshot::Sender<Result<(), ProposalError>>>,
+
+    /// Pending reads to be linearizable
+    pending_reads: HashMap<u64, oneshot::Sender<Result<(), ProposalError>>>,
 
     /// Entries since last snapshot
     num_entries: usize,
@@ -104,6 +129,7 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
     pub async fn new(
         config: RaftConfig<T, S>,
         proposal_receiver: sync::mpsc::Receiver<Proposal>,
+        read_receiver: sync::mpsc::Receiver<sync::oneshot::Sender<Result<(), ProposalError>>>,
         applied_sender: sync::mpsc::Sender<AppliedEntry>,
     ) -> Self {
         // build out the RaftCore type first, panicing in situations where errors occur because we
@@ -172,9 +198,11 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
         Self {
             id: config.id,
             proposal: proposal_receiver,
+            read: read_receiver,
             applied: applied_sender,
             interval,
             pending_proposals: HashMap::new(),
+            pending_reads: HashMap::new(),
             num_entries: 0,
             snapshot_threshold: config.snapshot_threshold,
             core,
@@ -217,6 +245,16 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                         }
                     }
                 },
+                Some(read_request) = self.read.recv() => {
+                    tracing::debug!(node_id = self.id, "read request received from application");
+                    if let Some(read_id) = self.core.request_read_barrier() {
+                        self.pending_reads.insert(read_id, read_request);
+                    } else {
+                        if read_request.send(Err(ProposalError::FollowerNode)).is_err() {
+                            tracing::warn!("Error sending read request response");
+                        }
+                    }
+                },
                 msg = self.transport.recv() => {
                     tracing::debug!(node_id = self.id, msg = %msg, "received Message");
                     let before = self.core.is_leader();
@@ -227,6 +265,9 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                         // proposals and notify them of failure
                         tracing::info!(node_id = self.id, "leadership change detected, draining pending proposals");
                         for (_, channel) in self.pending_proposals.drain() {
+                            let _ = channel.send(Err(ProposalError::LostLeadership));
+                        }
+                        for (_, channel) in self.pending_reads.drain() {
                             let _ = channel.send(Err(ProposalError::LostLeadership));
                         }
                     }
@@ -358,6 +399,11 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                         .await
                         .expect("Unable to clear persistent log; cannot continue");
                     self.num_entries = 0;
+                }
+            }
+            Action::ReadBarrierReady { id } => {
+                if let Some(sender) = self.pending_reads.remove(&id) {
+                    let _ = sender.send(Ok(()));
                 }
             }
         }
