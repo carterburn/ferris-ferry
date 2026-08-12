@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post},
 };
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use raft_event_loop::{
     RaftNode,
     types::{AppliedEntry, NodeId, ProposalError, RaftConfig, RaftNodeDescription},
@@ -22,6 +22,7 @@ use std::{
 };
 
 #[derive(Parser, Debug)]
+#[command(group(ArgGroup::new("identity").required(true).args(["id", "derive_id"])))]
 struct Args {
     // NOTE: This is where having a config file would be better and we can name the nodes and
     // ensure we are on the same page
@@ -39,9 +40,21 @@ struct Args {
     http_nodes: Option<Vec<String>>,
 
     /// The ID of this RaftNode. This should be the index (starting from 1) of this node's address
-    /// in the 'nodes' argument.
+    /// in the 'nodes' argument. More often than not, you'll want to use this option unless
+    /// deploying on a platform like Kubernetes. This option cannot be used in conjunction with
+    /// derive-id.
     #[arg(short, long)]
-    id: u64,
+    id: Option<NodeId>,
+
+    /// Derive the Raft node ID from the hostname set in the environment variable HOSTNAME. This
+    /// should only be used when you are deploying into an environment like Kubernetes where the
+    /// hostname of each instance is derivable. The hostnames in your configuration should be
+    /// structured like 'raft-node-0', 'raft-node-1', etc. and this derivation will take the number
+    /// following the final '-'. This cannot be used in conjunction with id and remember you most
+    /// likely don't want this unless deploying into Kubernetes. Start
+    /// numbering from 0 (which is default in kubernetes).
+    #[arg(long)]
+    derive_id: bool,
 
     /// The address for Raft to bind on. Most of the time, this will match the IP:Port address in
     /// the nodes list, but in the case that the advertised address and bound address differ, this
@@ -56,6 +69,33 @@ struct Args {
     /// The path to store durable storage. Must be a directory path!
     #[arg(short, long, default_value = "/var/lib/raft")]
     directory: PathBuf,
+}
+
+fn id_from_hostname(hostname: &str) -> Result<NodeId, String> {
+    let (_, num) = hostname
+        .rsplit_once('-')
+        .ok_or_else(|| format!("Hostname {hostname} has no final '-' with ID number"))?;
+    let id: u64 = num
+        .parse()
+        .map_err(|_| format!("Invalid number for hostname: {num}"))?;
+    id.checked_add(1)
+        .ok_or_else(|| format!("{id} is not a valid number (try using something < 2^64)"))
+}
+
+impl Args {
+    fn resolve_id(&self) -> Result<NodeId, String> {
+        match (self.id, self.derive_id) {
+            (Some(id), false) => Ok(id),
+            (None, true) => {
+                let hostname = std::env::var("HOSTNAME").map_err(|_| {
+                    "Attempted to derive node ID but HOSTNAME variable not set.".to_string()
+                })?;
+                id_from_hostname(&hostname)
+            }
+            // anything else should be unreachable from the ArgGroup
+            _ => unreachable!("Use one of --id or --derive-id to set or derive this node's ID"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -113,7 +153,7 @@ impl AppState {
     }
 }
 
-async fn build_config(args: Args) -> RaftConfig<TcpTransport, FileStorage> {
+async fn build_config(node_id: NodeId, args: Args) -> RaftConfig<TcpTransport, FileStorage> {
     let nodes: Vec<RaftNodeDescription<TcpTransport>> = args
         .nodes
         .iter()
@@ -127,10 +167,10 @@ async fn build_config(args: Args) -> RaftConfig<TcpTransport, FileStorage> {
     let storage = FileStorage::new(args.directory)
         .await
         .expect("Unable to initialize FileStorage");
-    let transport = TcpTransport::new(args.id, args.bind_addr, &nodes).await;
+    let transport = TcpTransport::new(node_id, args.bind_addr, &nodes).await;
 
     RaftConfig {
-        id: args.id,
+        id: node_id,
         nodes,
         heartbeat_interval: None,
         election_range: 15..31,
@@ -210,6 +250,15 @@ async fn delete_handler(
     Ok(Json(DeleteResponse { success: true }))
 }
 
+async fn health() -> StatusCode {
+    // TODO(cb): this is sort of a 'dumb' health check for kubernetes / docker. A possible issue is
+    // that the raft-event-loop could actually die and HTTP still runs perfectly. If the event
+    // loop's task panic'ed, HTTP would continue to serve requests just saying it can't. In reality
+    // we'd want a smarter way to query the event loop and would know that if a channel is dropped,
+    // we're actually not ok and should get restarted. This should work for now though.
+    StatusCode::OK
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -249,15 +298,23 @@ async fn main() {
             }))
         }
     };
+    let node_id = match args.resolve_id() {
+        Ok(id) => id,
+        Err(e) => {
+            panic!("Encountered error while deriving ID: {e}");
+        }
+    };
     // validate id passed
-    if args.id == 0 || args.id as usize > args.nodes.len() {
+    if node_id == 0 || node_id as usize > args.nodes.len() {
         panic!(
-            "--id must be between 1 and {} (got {})",
+            "--id must be between 1 and {} (got {} from hostname: {})",
             args.nodes.len(),
-            args.id
+            node_id - 1,
+            // SAFETY: we already know HOSTNAME is in the environment from resolve_id working
+            std::env::var("HOSTNAME").unwrap(),
         );
     }
-    let advertised_port = args.nodes[args.id as usize - 1]
+    let advertised_port = args.nodes[node_id as usize - 1]
         .rsplit_once(':')
         .expect("Invalid node address")
         .1;
@@ -270,7 +327,7 @@ async fn main() {
             "Advertised address for this node to others and this node's bind address is different. This MAY not be an error, but ensure you meant to do this."
         );
     }
-    let config = build_config(args).await;
+    let config = build_config(node_id, args).await;
     tracing::info!("Initializing Raft node");
     let (raft_node, mut applied_receiver) = RaftNode::new(config).await;
 
@@ -333,8 +390,27 @@ async fn main() {
         .route("/key", post(set_handler))
         .route("/key/{name}", get(get_handler))
         .route("/key/{name}", delete(delete_handler))
+        .route("/healthz", get(health))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_id_from_hostname() {
+        assert_eq!(id_from_hostname("raft-kv-0"), Ok(1));
+        assert_eq!(
+            id_from_hostname("raft-kv-7d9f-x2k302"),
+            Err("Invalid number for hostname: x2k302".to_string())
+        );
+        assert_eq!(
+            id_from_hostname("localhost"),
+            Err("Hostname localhost has no final '-' with ID number".to_string())
+        );
+    }
 }
