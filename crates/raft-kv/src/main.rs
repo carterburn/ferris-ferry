@@ -1,13 +1,14 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, Uri, header},
+    response::IntoResponse,
     routing::{delete, get, post},
 };
 use clap::Parser;
 use raft_event_loop::{
     RaftNode,
-    types::{AppliedEntry, RaftConfig, RaftNodeDescription},
+    types::{AppliedEntry, NodeId, ProposalError, RaftConfig, RaftNodeDescription},
 };
 use raft_file_storage::FileStorage;
 use raft_tcp_transport::TcpTransport;
@@ -27,20 +28,33 @@ struct Args {
     /// Comma separated list of Raft Nodes including the address for this Raft Node's (for
     /// participating in the cluster). Format for these addresses is IP:Port. Note: each RaftNode
     /// should be started with the exact same order of these addresses to ensure compatibility.
-    #[arg(short, long, value_delimiter = ',')]
-    nodes: Vec<SocketAddr>,
+    #[arg(short, long, value_delimiter = ',', required = true)]
+    nodes: Vec<String>,
+
+    /// Optional list of HTTP addresses if nodes run on the same machine. raft-kv will use the HTTP
+    /// port for _this_ instance to send redirects to the leader of the cluster. The only time this
+    /// is not available is local testing when you can't share a port. When deployed in a
+    /// kubernetes cluster, for example, each node can share the port.
+    #[arg(long, value_delimiter = ',')]
+    http_nodes: Option<Vec<String>>,
 
     /// The ID of this RaftNode. This should be the index (starting from 1) of this node's address
     /// in the 'nodes' argument.
     #[arg(short, long)]
     id: u64,
 
+    /// The address for Raft to bind on. Most of the time, this will match the IP:Port address in
+    /// the nodes list, but in the case that the advertised address and bound address differ, this
+    /// argument will be important.
+    #[arg(short, long, default_value = "0.0.0.0:9000")]
+    bind_addr: SocketAddr,
+
     /// HTTP address for this Key-Value store. Default: 0.0.0.0:3000.
     #[arg(short, long, default_value = "0.0.0.0:3000")]
     addr: SocketAddr,
 
     /// The path to store durable storage. Must be a directory path!
-    #[arg(short, long, default_value = "/tmp/raft")]
+    #[arg(short, long, default_value = "/var/lib/raft")]
     directory: PathBuf,
 }
 
@@ -51,10 +65,52 @@ enum KvCommand {
     Delete(String),
 }
 
+enum KvError {
+    /// Not the leader, but we're aware who is so we can redirect
+    Redirect(String),
+    /// Not the leader but the leader is not known
+    NoLeader,
+    /// Was the leader when the proposal was accepted
+    Uncertain,
+    Internal,
+}
+
+impl IntoResponse for KvError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            KvError::Redirect(url) => {
+                (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, url)]).into_response()
+            }
+            KvError::NoLeader | KvError::Uncertain => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+            )
+                .into_response(),
+            KvError::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+}
+
 struct AppState {
     node: RaftNode,
 
     store: Arc<RwLock<HashMap<String, String>>>,
+
+    http_addrs: HashMap<NodeId, String>,
+}
+
+impl AppState {
+    fn map_proposal_error(&self, err: ProposalError, uri: &Uri) -> KvError {
+        match err {
+            ProposalError::FollowerNode { leader: Some(id) } => match self.http_addrs.get(&id) {
+                Some(addr) => KvError::Redirect(format!("http://{addr}{}", uri.path())),
+                None => KvError::NoLeader,
+            },
+            ProposalError::FollowerNode { leader: None } => KvError::NoLeader,
+            ProposalError::LostLeadership => KvError::Uncertain,
+            ProposalError::OtherError => KvError::Internal,
+        }
+    }
 }
 
 async fn build_config(args: Args) -> RaftConfig<TcpTransport, FileStorage> {
@@ -64,14 +120,14 @@ async fn build_config(args: Args) -> RaftConfig<TcpTransport, FileStorage> {
         .enumerate()
         .map(|(idx, s)| RaftNodeDescription {
             id: (idx + 1) as u64,
-            address: *s,
+            address: s.clone(),
         })
         .collect();
 
     let storage = FileStorage::new(args.directory)
         .await
         .expect("Unable to initialize FileStorage");
-    let transport = TcpTransport::new(args.id, &nodes).await;
+    let transport = TcpTransport::new(args.id, args.bind_addr, &nodes).await;
 
     RaftConfig {
         id: args.id,
@@ -79,8 +135,7 @@ async fn build_config(args: Args) -> RaftConfig<TcpTransport, FileStorage> {
         heartbeat_interval: None,
         election_range: 15..31,
         tick_length: Duration::from_millis(10),
-        //snapshot_threshold: 1024,
-        snapshot_threshold: 5,
+        snapshot_threshold: 1024,
         transport,
         storage,
     }
@@ -108,34 +163,33 @@ pub struct DeleteResponse {
 
 async fn set_handler(
     State(state): State<Arc<AppState>>,
+    uri: Uri,
     Json(body): Json<SetRequest>,
-) -> Result<Json<SetResponse>, StatusCode> {
+) -> Result<Json<SetResponse>, KvError> {
     // propose the command through Raft and wait the response
     let command = postcard::to_allocvec(&KvCommand::Set(body.key, body.value))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    // TODO: This may turn into a redirect in the future
+        .map_err(|_| KvError::Internal)?;
     state
         .node
         .propose(command)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| state.map_proposal_error(e, &uri))?;
     Ok(Json(SetResponse { success: true }))
 }
 
 async fn get_handler(
     State(state): State<Arc<AppState>>,
+    uri: Uri,
     Path(key): Path<String>,
-) -> Result<Json<GetResponse>, StatusCode> {
-    state.node.read_request().await.map_err(|e| match e {
-        raft_event_loop::types::ProposalError::FollowerNode => StatusCode::BAD_REQUEST,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+) -> Result<Json<GetResponse>, KvError> {
+    state
+        .node
+        .read_request()
+        .await
+        .map_err(|e| state.map_proposal_error(e, &uri))?;
 
     // cleared to do a read from the local state
-    let state = state
-        .store
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let state = state.store.read().map_err(|_| KvError::Internal)?;
     let value = state.get(&key);
     Ok(Json(GetResponse {
         value: value.cloned(),
@@ -144,15 +198,15 @@ async fn get_handler(
 
 async fn delete_handler(
     State(state): State<Arc<AppState>>,
+    uri: Uri,
     Path(key): Path<String>,
-) -> Result<Json<DeleteResponse>, StatusCode> {
-    let command = postcard::to_allocvec(&KvCommand::Delete(key))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+) -> Result<Json<DeleteResponse>, KvError> {
+    let command = postcard::to_allocvec(&KvCommand::Delete(key)).map_err(|_| KvError::Internal)?;
     state
         .node
         .propose(command)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| state.map_proposal_error(e, &uri))?;
     Ok(Json(DeleteResponse { success: true }))
 }
 
@@ -165,8 +219,57 @@ async fn main() {
 
     tracing::debug!("Starting Raft KV with configuration: {args:?}");
 
+    if let Some(ref http_addrs) = args.http_nodes
+        && http_addrs.len() != args.nodes.len()
+    {
+        panic!("Number of Raft nodes and HTTP nodes for KV service don't match. Check your config");
+    }
+
     tracing::info!("Initializing persistent storage and transport");
     let http_addr = args.addr;
+    // TODO(cb): NodeId's being 1-indexed causes the idx + 1 in these HashMap constructions. This
+    // should be done in one place with the construction of the config because I had forgotten it
+    // at first and it would've been a bad off-by-one error. The HTTP addrs should come out of the
+    // build_config, but for now I'll leave this here.
+    let http_addrs = match args.http_nodes {
+        Some(ref http_nodes) => {
+            // specific addresses from the user
+            HashMap::from_iter(
+                http_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, s)| (idx as NodeId + 1, s.clone())),
+            )
+        }
+        None => {
+            // iterate over the raft node addresses, and use our args.addr.port() as the HTTP port
+            HashMap::from_iter(args.nodes.iter().enumerate().map(|(idx, s)| {
+                let ip = s.rsplit_once(":").expect("Invalid address for Raft node").0;
+                (idx as NodeId + 1, format!("{}:{}", ip, args.addr.port()))
+            }))
+        }
+    };
+    // validate id passed
+    if args.id == 0 || args.id as usize > args.nodes.len() {
+        panic!(
+            "--id must be between 1 and {} (got {})",
+            args.nodes.len(),
+            args.id
+        );
+    }
+    let advertised_port = args.nodes[args.id as usize - 1]
+        .rsplit_once(':')
+        .expect("Invalid node address")
+        .1;
+    if advertised_port
+        .parse::<u16>()
+        .expect("Invalid port number for advertised address")
+        != args.bind_addr.port()
+    {
+        tracing::warn!(
+            "Advertised address for this node to others and this node's bind address is different. This MAY not be an error, but ensure you meant to do this."
+        );
+    }
     let config = build_config(args).await;
     tracing::info!("Initializing Raft node");
     let (raft_node, mut applied_receiver) = RaftNode::new(config).await;
@@ -177,6 +280,7 @@ async fn main() {
     let state = Arc::new(AppState {
         node: raft_node,
         store: store.clone(),
+        http_addrs,
     });
 
     // kick off the ApplyReceiver task to read from the apply channel and write to the HashMap when

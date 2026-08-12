@@ -3,10 +3,10 @@ mod tests {
     use std::{collections::HashMap, time::Duration};
 
     use raft_event_loop::{
-        types::{AppliedEntry, PersistedMetadata, ProposalError, RaftConfig, RaftNodeDescription},
         RaftNode,
+        types::{AppliedEntry, PersistedMetadata, ProposalError, RaftConfig, RaftNodeDescription},
     };
-    use raft_test_utils::{build_in_memory_transport, InMemoryStorage, InMemoryTransport};
+    use raft_test_utils::{InMemoryStorage, InMemoryTransport, build_in_memory_transport};
     use raftcore::types::{LogEntry, NodeId};
     use tokio::sync::mpsc;
 
@@ -38,8 +38,7 @@ mod tests {
 
         // attempt to propose to each of the nodes in a loop until one doesn't have a
         // ProposalError::FollowerNode response
-        let mut leader_id = 0;
-        'outer: loop {
+        loop {
             for (idx, n) in nodes.iter().enumerate() {
                 if let Ok(proposal) = tokio::time::timeout(
                     Duration::from_millis(30),
@@ -49,13 +48,12 @@ mod tests {
                 {
                     if let Err(e) = proposal {
                         match e {
-                            ProposalError::FollowerNode => continue,
+                            ProposalError::FollowerNode { .. } => continue,
                             _ => panic!("Unexpected error from proposal"),
                         }
                     } else {
                         // got a good proposal in and found the leader
-                        leader_id = (idx + 1) as u64;
-                        break 'outer;
+                        return ((idx + 1) as u64, nodes);
                     }
                 } else {
                     // move on to another node, this timed out
@@ -63,14 +61,13 @@ mod tests {
                 }
             }
         }
-        (leader_id, nodes)
     }
 
     #[tokio::test]
     async fn basic_cluster() {
         // since we successfully proposed a command, each node should get an applied entry out of
         // its applied channel
-        let (leader_id, nodes) = init_three_node_cluster().await;
+        let (_leader_id, nodes) = init_three_node_cluster().await;
         for mut n in nodes {
             if let Some(application) = n.1.recv().await {
                 match application {

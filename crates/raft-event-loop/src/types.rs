@@ -1,8 +1,10 @@
 use std::{fmt::Display, ops::Range, time::Duration};
 
-use raftcore::types::{LogEntry, Message, NodeId};
+use raftcore::types::{LogEntry, Message};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+
+pub use raftcore::types::NodeId;
 
 pub struct RaftConfig<T: Transport, S: Storage> {
     pub id: NodeId,
@@ -104,7 +106,7 @@ pub struct Proposal {
 
 #[derive(Debug)]
 pub enum ProposalError {
-    FollowerNode,
+    FollowerNode { leader: Option<NodeId> },
     LostLeadership,
     OtherError,
 }
@@ -113,7 +115,10 @@ impl Display for ProposalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use ProposalError::*;
         match self {
-            FollowerNode => write!(f, "Node is not the leader and cannot propose commands"),
+            FollowerNode { leader } => write!(
+                f,
+                "Node is not the leader and cannot propose commands (leader: {leader:?})"
+            ),
             LostLeadership => write!(
                 f,
                 "Node lost its status as leader and cannot propose commands anymore"

@@ -63,6 +63,8 @@ pub struct RaftCore {
     // --- Volatile State ---
     commit_index: u64,
     last_applied: u64,
+    /// A helper not defined by the Raft paper to support users to know the current leader.
+    current_leader: Option<NodeId>,
     // --- End Volatile State ---
 
     // --- Leader Volatile State ---
@@ -125,6 +127,7 @@ impl RaftCore {
             log,
             commit_index: 0,
             last_applied: 0,
+            current_leader: None,
             next_index: HashMap::with_capacity(num_peers),
             match_index: HashMap::with_capacity(num_peers),
             votes_received: HashSet::new(),
@@ -221,6 +224,11 @@ impl RaftCore {
     /// Returns if the node is currently the leader
     pub fn is_leader(&self) -> bool {
         self.state == RaftState::Leader
+    }
+
+    /// Returns the current leader directly.
+    pub fn current_leader(&self) -> Option<NodeId> {
+        self.current_leader
     }
 
     /// Returns the logical index of the last entry including snapshots.
@@ -390,6 +398,8 @@ impl RaftCore {
             // start an election
             self.current_term += 1;
             self.state = RaftState::Candidate;
+            // no current leader now, we're about to find a new one
+            self.current_leader = None;
 
             // reset votes and vote for ourself
             self.votes_received.clear();
@@ -441,6 +451,9 @@ impl RaftCore {
             self.reset_election_timeout();
             // clear out all pending reads
             self.read_barriers.drain();
+            // clear current leader because we don't know yet; we will figure it out on subsequent
+            // messages
+            self.current_leader = None;
             Some(vec![Action::PersistMetadata {
                 term: self.current_term,
                 voted_for: self.voted_for,
@@ -531,6 +544,7 @@ impl RaftCore {
                 // we won the election, transition to leader state
                 tracing::info!(node_id = self.id, "won election, transition to Leader");
                 self.state = RaftState::Leader;
+                self.current_leader = Some(self.id);
                 actions.push(self.initialize_leader_state());
                 self.reset_election_timeout();
                 actions.extend(self.append_entries());
@@ -602,6 +616,7 @@ impl RaftCore {
 
         // reset election timeout since we have a valid leader on the right term
         self.reset_election_timeout();
+        self.current_leader = Some(req.leader_id);
 
         // ensure that the previous log index is actually less than our current length and at the
         // log index (the last the leader was tracking for us) matches the term
@@ -914,6 +929,7 @@ impl RaftCore {
         }
 
         self.reset_election_timeout();
+        self.current_leader = Some(req.leader_id);
 
         if req.last_included_index <= self.last_included_index {
             // stale snapshot, just return
@@ -1424,6 +1440,9 @@ mod tests {
         assert_eq!(cluster.node(3).state, RaftState::Follower);
         assert_eq!(cluster.node(2).current_term, 1);
         assert_eq!(cluster.node(3).current_term, 1);
+        assert_eq!(cluster.node(1).current_leader, Some(1));
+        assert_eq!(cluster.node(2).current_leader, Some(1));
+        assert_eq!(cluster.node(3).current_leader, Some(1));
     }
 
     #[test]
@@ -1559,6 +1578,8 @@ mod tests {
         // node1 should now be a Follower, have voted for node2 and be on term next_term
         assert!(node1.state == RaftState::Follower);
         assert_eq!(node1.voted_for, Some(2));
+        // just because we voted doesn't mean that is the leader
+        assert_eq!(node1.current_leader, None);
         assert_eq!(node1.current_term, next_term);
 
         if let Action::SendMessage { target: _, message } = &node1_actions[0] {
@@ -1579,6 +1600,7 @@ mod tests {
         tick_until_candidate(&mut node1);
         let actions = node1.tick();
         assert!(node1.state == RaftState::Candidate);
+        assert_eq!(node1.current_leader, None);
         assert_eq!(node1.current_term, 1);
         // node1 is a candidate, send requests to node2 / node3
 
@@ -1712,6 +1734,7 @@ mod tests {
         let _ = deliver_request_votes(node_map, vote_requests);
 
         assert!(node1.state == RaftState::Follower);
+        assert_eq!(node1.current_leader, None);
     }
 
     /// Make provided ID the leader
@@ -1899,6 +1922,7 @@ mod tests {
         };
         let action = node2.handle_append_entries(msg);
         assert_eq!(action.len(), 1);
+        assert_eq!(node2.current_leader, None);
 
         if let Action::SendMessage { target: _, message } = &action[0] {
             if let Message::AppendEntriesResponse(resp) = message {
@@ -2419,6 +2443,8 @@ mod tests {
             .next_index
             .entry(2)
             .and_modify(|v| *v = 5);
+        // force node 2's current_leader to be None since the prev_log_index was forced to 5 here
+        cluster.node_mut(2).current_leader = None;
         cluster
             .node_mut(1)
             .next_index
@@ -2502,6 +2528,7 @@ mod tests {
                 .map(|entry| entry.term)
                 .collect::<Vec<_>>()
         );
+        assert_eq!(cluster.node(2).current_leader, Some(1));
     }
 
     #[test]
@@ -3503,6 +3530,7 @@ mod tests {
             data: vec![],
         });
         assert_eq!(actions.len(), 1);
+        assert_eq!(node.current_leader, None);
         if let Action::SendMessage {
             target: 2,
             message: Message::InstallSnapshotResponse(resp),
@@ -3521,6 +3549,7 @@ mod tests {
             data: vec![],
         });
         assert_eq!(actions.len(), 1);
+        assert_eq!(node.current_leader, Some(2));
         if let Action::SendMessage {
             target: 2,
             message: Message::InstallSnapshotResponse(resp),
@@ -3617,6 +3646,7 @@ mod tests {
         assert_eq!(node.last_included_term, 3);
         assert_eq!(node.last_applied, 50);
         assert_eq!(node.commit_index, 50);
+        assert_eq!(node.current_leader, Some(2));
     }
 
     #[test]
