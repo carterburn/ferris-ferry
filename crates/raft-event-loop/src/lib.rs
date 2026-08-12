@@ -240,7 +240,8 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                             self.handle_action(action).await;
                         }
                     } else {
-                        if proposal.respond.send(Err(ProposalError::FollowerNode)).is_err() {
+                        let err = ProposalError::FollowerNode { leader: self.core.current_leader() };
+                        if proposal.respond.send(Err(err)).is_err() {
                             tracing::warn!("Error sending proposal response")
                         }
                     }
@@ -250,7 +251,8 @@ impl<T: Transport, S: Storage> RaftDriver<T, S> {
                     if let Some(read_id) = self.core.request_read_barrier() {
                         self.pending_reads.insert(read_id, read_request);
                     } else {
-                        if read_request.send(Err(ProposalError::FollowerNode)).is_err() {
+                        let err = ProposalError::FollowerNode { leader: self.core.current_leader() };
+                        if read_request.send(Err(err)).is_err() {
                             tracing::warn!("Error sending read request response");
                         }
                     }

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr};
 
-use futures::{sink::SinkExt, StreamExt};
+use futures::{StreamExt, sink::SinkExt};
 use raft_event_loop::types::{RaftNodeDescription, Transport};
 use raftcore::types::{Message, NodeId};
 use tokio::{
@@ -16,7 +16,11 @@ pub struct TcpTransport {
 }
 
 impl TcpTransport {
-    pub async fn new(id: NodeId, nodes: &[RaftNodeDescription<Self>]) -> Self {
+    pub async fn new(
+        id: NodeId,
+        bind_addr: SocketAddr,
+        nodes: &[RaftNodeDescription<Self>],
+    ) -> Self {
         let mut senders = HashMap::new();
         let (receiver_tx, receiver_rx) = mpsc::unbounded_channel();
         for n in nodes {
@@ -24,7 +28,7 @@ impl TcpTransport {
                 // spawn the listener at the specified address for receiving messages from other
                 // nodes
                 let rtx = receiver_tx.clone();
-                let listener = TcpListener::bind(n.address)
+                let listener = TcpListener::bind(bind_addr)
                     .await
                     .expect("Unable to bind to address");
                 tokio::spawn(async move {
@@ -52,13 +56,14 @@ impl TcpTransport {
             } else {
                 // spawn the sender task for this peer providing the address
                 let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-                let address = n.address;
+                let address = n.address.clone();
 
                 tokio::spawn(async move {
                     let mut stream: Option<Framed<TcpStream, LengthDelimitedCodec>> = None;
                     while let Some(msg) = rx.recv().await {
                         if stream.is_none() {
-                            let Ok(connected_stream) = TcpStream::connect(address).await else {
+                            let Ok(connected_stream) = TcpStream::connect(address.as_str()).await
+                            else {
                                 // can't connect so just continue the loop for the next message to
                                 // try again
                                 continue;
@@ -89,7 +94,7 @@ impl TcpTransport {
 }
 
 impl Transport for TcpTransport {
-    type Address = SocketAddr;
+    type Address = String;
 
     async fn send(&self, node: NodeId, message: Message) {
         let Some(sender) = self.senders.get(&node) else {
@@ -124,22 +129,26 @@ mod tests {
         let desc = vec![
             RaftNodeDescription::<TcpTransport> {
                 id: 1,
-                address: SocketAddr::new(
-                    std::net::IpAddr::V4(Ipv4Addr::from_str("127.0.0.1").unwrap()),
-                    65000,
-                ),
+                address: "127.0.0.1:65000".to_string(),
             },
             RaftNodeDescription::<TcpTransport> {
                 id: 2,
-                address: SocketAddr::new(
-                    std::net::IpAddr::V4(Ipv4Addr::from_str("127.0.0.1").unwrap()),
-                    65001,
-                ),
+                address: "127.0.0.1:65001".to_string(),
             },
         ];
 
-        let mut node_1_transport = TcpTransport::new(1, &desc).await;
-        let mut node_2_transport = TcpTransport::new(2, &desc).await;
+        let mut node_1_transport = TcpTransport::new(
+            1,
+            SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 65000),
+            &desc,
+        )
+        .await;
+        let mut node_2_transport = TcpTransport::new(
+            2,
+            SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 65001),
+            &desc,
+        )
+        .await;
 
         // both transports are up so let's send some messages!
         let m = Message::RequestVote(raftcore::types::RequestVoteRPC {
@@ -163,12 +172,13 @@ mod tests {
         // situation to if a node dropped its connection)
         let transport = TcpTransport::new(
             1,
+            SocketAddr::new(
+                std::net::IpAddr::V4(Ipv4Addr::from_str("127.0.0.1").unwrap()),
+                65002,
+            ),
             &[RaftNodeDescription::<TcpTransport> {
                 id: 1,
-                address: SocketAddr::new(
-                    std::net::IpAddr::V4(Ipv4Addr::from_str("127.0.0.1").unwrap()),
-                    65002,
-                ),
+                address: "127.0.0.1:65002".to_string(),
             }],
         )
         .await;
