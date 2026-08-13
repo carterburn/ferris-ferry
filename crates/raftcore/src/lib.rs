@@ -540,6 +540,11 @@ impl RaftCore {
             // received a vote for this election
             self.votes_received.insert(resp.id);
 
+            // TODO(cb): This quorum check is sound, but only fires when the node receives a
+            // response to a RequestVote sent out. In the case that N=1 (we are the only node in
+            // the cluster), this code path never executes and the single node would never become
+            // the leader. As a result, we need to add a special case check when we start an
+            // election to see if we are the only node and automatically make ourselves the leader.
             if self.votes_received.len() as u64 > ((self.peers.len() as u64 + 1) / 2) {
                 // we won the election, transition to leader state
                 tracing::info!(node_id = self.id, "won election, transition to Leader");
@@ -782,7 +787,11 @@ impl RaftCore {
             return actions;
         };
 
-        // grab the minimum value that a majority of servers has in their match_index
+        // TODO(cb): As mentioned in the comment on L543, we will also need to take this logic in
+        // the special case that we are the only node in the cluster. In that case, we would never
+        // compute this commit index because we would never receive a AppendEntriesResponse from
+        // any peers. This logic then needs to be inlined when we receive a new proposed command
+        // and we will advance the commit index and apply the new command to the state machine.
         let mut peer_indices: Vec<u64> = self.match_index.values().copied().collect();
         // add leader's highest index we have in the log
         peer_indices.push(self.last_log_index());

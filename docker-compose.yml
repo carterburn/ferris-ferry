@@ -1,0 +1,67 @@
+# Three-node raft-kv cluster for local smoke testing.
+#
+# Raft traffic (port 9000) stays inside the compose network and uses service
+# names, so every node can share the same port. HTTP is published on distinct
+# host ports because leader redirects are followed by the *client* -- the
+# addresses in --http-nodes must resolve from the host, not from inside the
+# network.
+#
+#   docker compose up --build
+#   curl -i -L -X POST localhost:3001/key -H 'content-type: application/json' -d '{"key":"hello","value":"world"}'
+#   curl -i localhost:3001/key/hello
+
+x-raft-node: &raft-node
+  image: raft-kv:dev
+  build: .
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *raft-node
+    hostname: node1
+    ports:
+      - "3001:3000"
+    volumes:
+      - node1-data:/var/lib/raft
+    command:
+      - --nodes
+      - node1:9000,node2:9000,node3:9000
+      - --http-nodes
+      - localhost:3001,localhost:3002,localhost:3003
+      - --id
+      - "1"
+
+  node2:
+    <<: *raft-node
+    hostname: node2
+    ports:
+      - "3002:3000"
+    volumes:
+      - node2-data:/var/lib/raft
+    command:
+      - --nodes
+      - node1:9000,node2:9000,node3:9000
+      - --http-nodes
+      - localhost:3001,localhost:3002,localhost:3003
+      - --id
+      - "2"
+
+  node3:
+    <<: *raft-node
+    hostname: node3
+    ports:
+      - "3003:3000"
+    volumes:
+      - node3-data:/var/lib/raft
+    command:
+      - --nodes
+      - node1:9000,node2:9000,node3:9000
+      - --http-nodes
+      - localhost:3001,localhost:3002,localhost:3003
+      - --id
+      - "3"
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

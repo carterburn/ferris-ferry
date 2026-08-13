@@ -262,7 +262,9 @@ async fn health() -> StatusCode {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
     let args = Args::parse();
 
@@ -394,7 +396,30 @@ async fn main() {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install ctrl-c handler");
+    };
+
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 #[cfg(test)]

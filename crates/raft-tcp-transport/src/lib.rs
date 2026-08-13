@@ -66,6 +66,16 @@ impl TcpTransport {
                             else {
                                 // can't connect so just continue the loop for the next message to
                                 // try again
+                                // TODO(cb): actually, this does create a bit of a delay when a
+                                // previously dead node rejoins the cluster. It doesn't hurt the
+                                // safety of the cluster, but does typically make it harder for a
+                                // rejoined node to communicate resulting in 1-2 election rounds.
+                                // The fix here is to actually kick off a exponential backoff
+                                // reconnect loop to try to connect to a peer we
+                                // lost comms with. We whould still take messages from rx and keep
+                                // the last message because we don't want the connection to come
+                                // back and have to fire off many messages. The last message is the
+                                // only one truly needed.
                                 continue;
                             };
                             let framed = Framed::new(connected_stream, LengthDelimitedCodec::new());

@@ -3,3 +3,6 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.dependencies]
+
+[profile.release]
+strip = "symbols"
