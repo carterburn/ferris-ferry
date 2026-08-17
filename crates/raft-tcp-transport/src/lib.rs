@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 use futures::{StreamExt, sink::SinkExt};
 use raft_event_loop::types::{RaftNodeDescription, Transport};
@@ -6,6 +6,7 @@ use raftcore::types::{Message, NodeId};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    time::Instant,
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -16,6 +17,20 @@ pub struct TcpTransport {
 }
 
 impl TcpTransport {
+    // The max time we wait to try reconnects must be less than the default tick interval
+    // window so that we retry before a timeout occurs. Of course, this is a variale in the
+    // instantiation of RaftCore, but we're writing this transport for raft-kv, so we can make a
+    // const tied to our creation.
+    const MAX_BACKOFF: Duration = Duration::from_millis(100);
+
+    // This is the starting point of our exponential backoff retry loop. This is just a small
+    // number decently far from the MAX_BACKOFF.
+    const MIN_BACKOFF: Duration = Duration::from_millis(10);
+
+    // The connect timeout is normally two minutes. We will set it to 10 seconds. Of course, this
+    // can be network dependent so this currently isn't a 'sound' constant.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
     pub async fn new(
         id: NodeId,
         bind_addr: SocketAddr,
@@ -58,36 +73,86 @@ impl TcpTransport {
                 let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
                 let address = n.address.clone();
 
+                // this send loop is more important than it may seem. we must not just watch the rx
+                // from the channel but also want to detect if the TCP connection is dropped (we
+                // receive a FIN from the peer)
                 tokio::spawn(async move {
                     let mut stream: Option<Framed<TcpStream, LengthDelimitedCodec>> = None;
-                    while let Some(msg) = rx.recv().await {
-                        if stream.is_none() {
-                            let Ok(connected_stream) = TcpStream::connect(address.as_str()).await
-                            else {
-                                // can't connect so just continue the loop for the next message to
-                                // try again
-                                // TODO(cb): actually, this does create a bit of a delay when a
-                                // previously dead node rejoins the cluster. It doesn't hurt the
-                                // safety of the cluster, but does typically make it harder for a
-                                // rejoined node to communicate resulting in 1-2 election rounds.
-                                // The fix here is to actually kick off a exponential backoff
-                                // reconnect loop to try to connect to a peer we
-                                // lost comms with. We whould still take messages from rx and keep
-                                // the last message because we don't want the connection to come
-                                // back and have to fire off many messages. The last message is the
-                                // only one truly needed.
-                                continue;
-                            };
-                            let framed = Framed::new(connected_stream, LengthDelimitedCodec::new());
-                            stream = Some(framed);
-                        }
+                    let mut pending: Option<Message> = None;
+                    let mut backoff = Self::MIN_BACKOFF;
+                    let mut deadline: Option<Instant> = None;
 
-                        if let Some(s) = stream.as_mut() {
-                            let Ok(buf) = postcard::to_allocvec(&msg) else {
+                    loop {
+                        if stream.is_none() {
+                            // no connection to the peer currently exists, so we need to attempt to
+                            // reconnect but not forget things coming in the channel. we only store
+                            // the most recent item from the channel as that is all that's needed
+                            // when the peer rejoins
+                            let fire = deadline.get_or_insert_with(|| Instant::now() + backoff);
+
+                            tokio::select! {
+                                maybe = rx.recv() => match maybe {
+                                    Some(m) => pending = Some(m),
+                                    None => break, // channel closed, we're done
+                                },
+                                _ = tokio::time::sleep_until(*fire) => {
+                                    match tokio::time::timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(address.as_str())).await {
+                                        Ok(Ok(s)) => {
+                                            // successful connection
+                                            stream = Some(Framed::new(s, LengthDelimitedCodec::new()));
+                                            backoff = Self::MIN_BACKOFF;
+                                            deadline = None;
+                                        },
+                                        _ => {
+                                            // timeout or couldn't connect, backoff
+                                            backoff = (2 * backoff).min(Self::MAX_BACKOFF);
+                                            deadline = Some(Instant::now() + backoff);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // we have a stream connected (hopefully), so we can attempt to send
+                            // first, we try to send anything in pending
+                            if let Some(msg) = pending.take()
+                                && let Some(s) = stream.as_mut()
+                            {
+                                let Ok(buf) = postcard::to_allocvec(&msg) else {
+                                    // try again
+                                    continue;
+                                };
+                                if s.send(buf.into()).await.is_err() {
+                                    // something happened with the stream...try again
+                                    pending = Some(msg);
+                                    stream = None;
+                                }
+                            }
+
+                            // then, we wait either for a new message on the channel or a FIN
+                            let Some(s) = stream.as_mut() else {
+                                // stream is None now
                                 continue;
                             };
-                            if s.send(buf.into()).await.is_err() {
-                                stream = None;
+
+                            tokio::select! {
+                                msg = rx.recv() => {
+                                    match msg {
+                                        Some(msg) => {
+                                            let Ok(buf) = postcard::to_allocvec(&msg) else {
+                                                continue;
+                                            };
+                                            if s.send(buf.into()).await.is_err() {
+                                                // save off the message
+                                                pending = Some(msg);
+                                                stream = None;
+                                            }
+                                        },
+                                        None => break,
+                                    }
+                                },
+                                _ = s.next() => {
+                                    stream = None;
+                                }
                             }
                         }
                     }

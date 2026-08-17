@@ -1,0 +1,185 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: raft-kv
+
+---
+# Headless service: gives each pod a stable per-pod DNS name,
+#   raft-kv-N.raft-kv-headless.raft-kv.svc.cluster.local
+# This is what makes --nodes byte-identical across every pod and what the
+# Raft transport dials on port 9000. clusterIP: None is what makes it headless.
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-kv-headless
+  namespace: raft-kv
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: raft-kv
+  ports:
+    - name: raft
+      port: 9000
+      targetPort: raft
+
+---
+# The one environment-specific knob. Redirect targets are consumed by the
+# *client*, so these must be addresses the client can actually reach --
+# which depends entirely on where this is deployed and how it is exposed:
+#
+#   kind / local demo   localhost:30001,localhost:30002,localhost:30003
+#   real cluster        per-pod Ingress or LoadBalancer hostnames, e.g.
+#                       raft-kv-0.example.com,raft-kv-1.example.com,...
+#
+# Must stay index-aligned to NodeId 1..3 and byte-identical across pods.
+# If this key is removed entirely, raft-kv falls back to convention
+# (peer Raft host + own HTTP port), which is correct only for in-cluster
+# clients.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: raft-kv-config
+  namespace: raft-kv
+data:
+  http-nodes: localhost:30001,localhost:30002,localhost:30003
+
+---
+# Per-pod NodePort services. Every node must be individually reachable from
+# outside the cluster, because a follower answers a write with a 307 pointing
+# at the leader -- and the client follows that URL itself. A round-robin
+# ClusterIP in front would hand external clients a Location they cannot
+# resolve, and would buy nothing anyway since reads and writes are both
+# leader-only.
+#
+# The nodePorts line up with --http-nodes below and with the kind config's
+# extraPortMappings, so localhost:3000N on the host reaches raft-kv-(N-1).
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-kv-0
+  namespace: raft-kv
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: raft-kv-0
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      nodePort: 30001
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-kv-1
+  namespace: raft-kv
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: raft-kv-1
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      nodePort: 30002
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-kv-2
+  namespace: raft-kv
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: raft-kv-2
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      nodePort: 30003
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: raft-kv
+  namespace: raft-kv
+spec:
+  serviceName: raft-kv-headless
+  replicas: 3
+  # Parallel so all three start at once and can form a quorum immediately.
+  # OrderedReady would bring up raft-kv-0 alone first, which this
+  # implementation cannot elect a leader for (N=1 is unsupported).
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: raft-kv
+  template:
+    metadata:
+      labels:
+        app: raft-kv
+    spec:
+      # fsGroup is what makes the mounted PVC writable by uid 10001. Without
+      # it the volume arrives root-owned and FileStorage's create_dir_all fails.
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: raft-kv
+          image: raft-kv:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            # Substituted into args below via $(VAR). Environment-specific --
+            # see the ConfigMap above.
+            - name: HTTP_NODES
+              valueFrom:
+                configMapKeyRef:
+                  name: raft-kv-config
+                  key: http-nodes
+          args:
+            - --derive-id
+            - --nodes
+            - raft-kv-0.raft-kv-headless.raft-kv.svc.cluster.local:9000,raft-kv-1.raft-kv-headless.raft-kv.svc.cluster.local:9000,raft-kv-2.raft-kv-headless.raft-kv.svc.cluster.local:9000
+            - --http-nodes
+            - $(HTTP_NODES)
+          ports:
+            - name: http
+              containerPort: 3000
+            - name: raft
+              containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/raft
+          # Liveness only -- deliberately not gated on leadership. A follower is
+          # healthy; removing followers from the service would break redirects.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

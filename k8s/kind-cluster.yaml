@@ -1,0 +1,25 @@
+# Single-node kind cluster for the raft-kv demo.
+#
+#   kind create cluster --config k8s/kind-cluster.yaml
+#   docker build -t raft-kv:dev .
+#   kind load docker-image raft-kv:dev --name raft-kv
+#   kubectl apply -f k8s/raft-kv.yaml
+#
+# All three pods land on the single node, so the NodePorts below are mapped
+# straight through to the host. That is what makes the leader redirects
+# (localhost:3000N) resolvable from outside the cluster.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: raft-kv
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30001
+        hostPort: 30001
+        protocol: TCP
+      - containerPort: 30002
+        hostPort: 30002
+        protocol: TCP
+      - containerPort: 30003
+        hostPort: 30003
+        protocol: TCP
